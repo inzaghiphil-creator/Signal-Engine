@@ -110,7 +110,8 @@ def render_report(m: dict, p: Params, mech: Mechanics, data_info: dict, open_pos
     L.append(bar)
     L.append(f" Data        : {data_info['bars']} bars @ {data_info['tf']}  ·  {data_info['start']} → {data_info['end']}  (UTC, bar-open)")
     L.append(f" Mode        : {p.mode} (threshold {p.threshold}/100) · TFs {p.tf_htf_s//60}m bias / {p.tf_mid_s//60}m momentum / {p.tf_base_s//60}m entry")
-    L.append(f" Costs       : fee {mech.fee_pct:.2f}%/side · slippage {mech.slippage_pct:.3f}%/fill")
+    costs_label = data_info.get("costs_label", f"fee {mech.fee_pct:.2f}%/side · slippage {mech.slippage_pct:.3f}%/fill")
+    L.append(f" Costs       : {costs_label}")
     L.append(f" Position    : {mech.qty_pct:.0f}% of equity · initial {mech.initial_capital:,.2f} USDT")
     L.append("")
     if m["trades"] == 0:

@@ -117,3 +117,24 @@ def align_htf(base_index: pd.DatetimeIndex, htf_df: pd.DataFrame, tf_base_s: int
         bad = target >= last_htf_open
         aligned[bad.values] = np.nan
     return aligned
+
+
+def estimate_mintick(df: "pd.DataFrame", max_rows: int = 20000) -> float:
+    """Estimate the symbol tick size from price precision in the export.
+
+    Exchanges round quotes to the mintick, so the finest decimal place seen
+    across OHLC is the tick size (e.g. Binance NEARUSDT → 0.001, KuCoin
+    NEAR-USDT → 0.0001). Used to translate the strategy's tick-based
+    slippage into a percent for the Python engine.
+    """
+    decimals = 0
+    for col in ("open", "high", "low", "close"):
+        for x in df[col].dropna().head(max_rows).to_numpy():
+            t = f"{x:.12f}".rstrip("0")
+            d = len(t.split(".")[1]) if "." in t else 0
+            if d > decimals:
+                decimals = d
+        if decimals >= 8:
+            break
+    decimals = min(decimals, 8)  # no exchange quotes finer than 1e-8
+    return 10.0 ** (-decimals) if decimals else 1.0

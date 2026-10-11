@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from . import data as D
-from .engine import Mechanics, run_backtest
+from .engine import Mechanics, resolve_slippage, run_backtest
 from .report import _pf_str
 from .signals import Params, compute_signals
 
@@ -68,7 +68,7 @@ def _quarter_stats(trades: pd.DataFrame, n_parts: int = 4) -> list[dict]:
 
 def oos(df: pd.DataFrame, mode: str, train_end: pd.Timestamp,
         min_trades: int = 30, top_n: int = 5,
-        fee_pct: float = 0.10, slip_pct: float = 0.02) -> str:
+        fee_pct: float = 0.10, slip_pct: float = 0.02, costs_label: str = "") -> str:
     mech = Mechanics(fee_pct=fee_pct, slippage_pct=slip_pct)
     thr_grid = REV_THRESHOLDS if mode == "REVERSAL" else GRID["thresholds"]
 
@@ -117,6 +117,8 @@ def oos(df: pd.DataFrame, mode: str, train_end: pd.Timestamp,
     L.append(f" Grid: {len(thr_grid)} thresholds × {len(GRID['stops'])} stops × {len(GRID['targets'])} targets × "
              f"{len(GRID['rooms'])} rooms = {len(thr_grid)*len(GRID['stops'])*len(GRID['targets'])*len(GRID['rooms'])} candidates · "
              f"min {min_trades} train trades · top {top_n} carried to test")
+    L.append(f" Costs: fee {fee_pct}%/side · slippage {(costs_label or f'{slip_pct:.3f}%/fill')}"
+             if costs_label else f" Costs: fee {fee_pct}%/side · slippage {slip_pct:.3f}%/fill")
     L.append("")
     L.append(f" {'#':>2} {'thr':>4} {'stop':>5} {'tgt':>5} {'room':>5} | {'TRAIN':^34} | {'TEST':^34}")
     L.append(f" {'':>2} {'':>4} {'':>5} {'':>5} {'':>5} | {'n':>5}{'win%':>7}{'PF':>7}{'net':>12} | {'n':>5}{'win%':>7}{'PF':>7}{'net':>12}")
@@ -167,7 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-trades", type=int, default=30, help="Minimum train trades to be eligible (default 30)")
     ap.add_argument("--top-n", type=int, default=5)
     ap.add_argument("--fee-pct", type=float, default=0.10)
-    ap.add_argument("--slippage-pct", type=float, default=0.02)
+    ap.add_argument("--slippage-ticks", type=int, default=2,
+                    help="Slippage in MINTICKS per fill (matches the Pine strategy default)")
+    ap.add_argument("--tick", type=float, default=None, help="Symbol mintick (default: auto from CSV)")
+    ap.add_argument("--slippage-pct", type=float, default=None, help="Explicit %% (overrides ticks)")
     args = ap.parse_args(argv)
 
     df = D.load_csv(args.csv)
@@ -176,8 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --train-end {args.train_end} must lie inside {df.index[0].date()} → {df.index[-1].date()}",
               file=sys.stderr)
         return 2
+    slip_pct, slip_label = resolve_slippage(df, args.slippage_pct, args.slippage_ticks, args.tick)
     print(oos(df, "SCALP" if args.mode == "scalp" else "REVERSAL", train_end,
-              args.min_trades, args.top_n, args.fee_pct, args.slippage_pct))
+              args.min_trades, args.top_n, args.fee_pct, slip_pct, costs_label=slip_label))
     return 0
 
 

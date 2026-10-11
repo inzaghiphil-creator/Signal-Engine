@@ -13,7 +13,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from backtester import data as D  # noqa: E402
-from backtester.engine import Mechanics, run_backtest  # noqa: E402
+from backtester.engine import Mechanics, resolve_slippage, run_backtest  # noqa: E402
 from backtester.report import compute_metrics, render_report  # noqa: E402
 from backtester.sample_data import generate  # noqa: E402
 from backtester.signals import Params, compute_signals  # noqa: E402
@@ -191,6 +191,19 @@ def main() -> int:
 
     # ── V2: per-side stats present ───────────────────────────────────────
     check("per-side stats in report", "LONG" in rep and "SHORT" in rep and "Avg bars held" in rep)
+
+    # ── V2.1: tick-based slippage resolution ─────────────────────────────
+    fake = df.copy()
+    for col in ("open", "high", "low", "close"):
+        fake[col] = fake[col].round(3)          # 3dp prices → tick 0.001 (Binance NEARUSDT)
+    tick = D.estimate_mintick(fake)
+    check("mintick auto-estimation (3dp → 0.001)", abs(tick - 0.001) < 1e-12, f"tick={tick}")
+    pct, label = resolve_slippage(fake, None, 2, None)
+    med = float(fake["close"].median())
+    check("2 ticks ≈ 0.002/price", abs(pct - 0.002 / med * 100.0) < 1e-12, f"pct={pct}")
+    pct2, _ = resolve_slippage(fake, 0.05, 2, None)
+    check("explicit pct overrides ticks", pct2 == 0.05)
+    check("explicit tick honored", abs(resolve_slippage(fake, None, 2, 0.0001)[0] - 0.0002 / med * 100.0) < 1e-12)
 
     # ── V2.1: data quality gate ──────────────────────────────────────────
     a = check_data.audit(df)

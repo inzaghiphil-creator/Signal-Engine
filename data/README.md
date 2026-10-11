@@ -48,7 +48,7 @@ are intentionally small enough to keep in git for reproducibility of tests.
 
 For the real-data validation cycle (`docs/NEXT_STEPS.md`):
 
-- **NEARUSDT.P 5m**, TradingView "Export chart data" CSV, range
+- **NEAR/USDT (Binance spot) 5m**, TradingView "Export chart data" CSV, range
   **2026-06-15 → 2026-10-11 UTC** (≈32k bars, includes the Oct 8–9 crash +
   recovery), saved as `data/near_5m_real.csv`.
 - Real exports are **git-ignored** (`data/*_real*.csv`) — they stay local.

@@ -12,7 +12,7 @@ import pandas as pd
 
 from . import __version__
 from . import data as D
-from .engine import Mechanics, run_backtest
+from .engine import Mechanics, resolve_slippage, run_backtest
 from .report import compute_metrics, render_report
 from .signals import Params, compute_signals
 
@@ -46,8 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-block-abnormal", action="store_true", help="Allow entries in ABNORMAL VOL regime")
 
     g = ap.add_argument_group("strategy mechanics")
-    g.add_argument("--fee-pct", type=float, default=0.10, help="Commission %% per side (default 0.10 = KuCoin taker)")
-    g.add_argument("--slippage-pct", type=float, default=0.02, help="Slippage %% per fill (default 0.02 ≈ 2 ticks @ 0.0001)")
+    g.add_argument("--fee-pct", type=float, default=0.10, help="Commission %% per side (default 0.10 = KuCoin/Binance taker)")
+    g.add_argument("--slippage-ticks", type=int, default=2,
+                   help="Slippage in MINTICKS per fill (default 2 = matches the Pine strategy's 'Slippage (ticks)')")
+    g.add_argument("--tick", type=float, default=None,
+                   help="Symbol mintick (default: auto-estimated from price precision in the CSV)")
+    g.add_argument("--slippage-pct", type=float, default=None,
+                   help="Explicit slippage %% per fill (overrides ticks; legacy)")
     g.add_argument("--initial-capital", type=float, default=10000.0)
     g.add_argument("--qty-pct", type=float, default=10.0, help="Position size %% of equity (default 10)")
 
@@ -129,11 +134,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             p.rev_thr = args.threshold
 
+    slip_pct, slip_label = resolve_slippage(df, args.slippage_pct, args.slippage_ticks, args.tick)
     mech = Mechanics(
         initial_capital=args.initial_capital,
         qty_pct=args.qty_pct,
         fee_pct=args.fee_pct,
-        slippage_pct=args.slippage_pct,
+        slippage_pct=slip_pct,
     )
 
     sig = compute_signals(df, p)
@@ -160,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     data_info = {
         "label": args.label or args.csv,
         "bars": len(df),
+        "costs_label": f"fee {args.fee_pct:.2f}%/side · slippage {slip_label}",
         "tf": f"{tf_base // 60}m" if tf_base % 60 == 0 else f"{tf_base}s",
         "start": df.index[0].strftime("%Y-%m-%d %H:%M"),
         "end": df.index[-1].strftime("%Y-%m-%d %H:%M"),

@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from . import data as D
+
 from .signals import Params, Signals
 
 
@@ -28,7 +30,25 @@ class Mechanics:
     initial_capital: float = 10000.0
     qty_pct: float = 10.0        # % of equity per position
     fee_pct: float = 0.10        # per side, percent of notional (KuCoin taker)
-    slippage_pct: float = 0.02   # percent of price per fill (≈2 ticks @0.0001)
+    slippage_pct: float = 0.02   # legacy fallback; prefer resolve_slippage()
+
+
+def resolve_slippage(df, slippage_pct: float | None, slippage_ticks: int = 2,
+                     tick: float | None = None) -> tuple[float, str]:
+    """Slippage as %/fill, matching the Pine strategy's tick-based default.
+
+    The TV strategy applies `slippage = inSlipTicks` in MINTICKS, which is a
+    different percent per symbol (Binance NEARUSDT 0.001-tick: 2 ticks ≈
+    0.038%; KuCoin 0.0001-tick: ≈ 0.004%). An explicit `slippage_pct`
+    overrides (legacy, exact). Otherwise: ticks x tick / median price.
+    """
+    if slippage_pct is not None:
+        return slippage_pct, f"{slippage_pct:.3f}%/fill (explicit)"
+    if tick is None:
+        tick = D.estimate_mintick(df)
+    px = float(df["close"].dropna().median())
+    pct = slippage_ticks * tick / px * 100.0
+    return pct, f"{slippage_ticks} ticks (tick {tick:g} \u2248 {pct:.3f}%/fill @ {px:g})"
 
 
 def run_backtest(base: pd.DataFrame, sig: Signals, p: Params, mech: Mechanics) -> tuple[pd.DataFrame, pd.Series, dict | None]:

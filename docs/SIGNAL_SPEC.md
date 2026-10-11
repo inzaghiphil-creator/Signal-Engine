@@ -155,8 +155,13 @@ A signal that fails any gate is **not** actionable (table shows why).
 ## 9. Costs (strategy / backtester)
 
 - Fee 0.10% per side (KuCoin taker, configurable)
-- Slippage 2 ticks (≈0.02% at 0.0001 tick, configurable) — applied to **all
-  fills** (entries and exits, adverse direction) in every implementation
+- Slippage = **2 minticks** per fill (the strategy's `Slippage (ticks)`
+  input, configurable), applied to **all fills** (entries and exits,
+  adverse direction) in every implementation. Expressed as a percent it is
+  symbol-dependent: 2×tick ÷ price (Binance NEARUSDT tick 0.001 @ $5.2 ≈
+  0.038%; KuCoin tick 0.0001 ≈ 0.004%). The Python CLI resolves this
+  automatically from the export's price precision (`--slippage-ticks`,
+  `--tick`, or an explicit legacy `--slippage-pct`).
 - Position = 10% of equity (configurable), initial capital 10,000
 - An open position at the end of data is excluded from closed-trade stats
   (same as the strategy tester's open position) and reported separately

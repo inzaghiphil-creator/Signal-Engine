@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from . import data as D
-from .engine import Mechanics, run_backtest
+from .engine import Mechanics, resolve_slippage, run_backtest
 from .report import _pf_str
 from .signals import Params, compute_signals
 
@@ -208,7 +208,7 @@ def diagnose(df: pd.DataFrame, trades: pd.DataFrame, sig, p: Params, mech: Mecha
 
     # cost sensitivity
     cs = cost_sensitivity(trades, df)
-    L.append(f" COST SENSITIVITY (sizing held constant; base = fee {mech.fee_pct}%/side + slip {mech.slippage_pct}%/fill)")
+    L.append(f" COST SENSITIVITY (sizing held constant; base = fee {mech.fee_pct:.2f}%/side + slip {mech.slippage_pct:.3f}%/fill)")
     L.append(f" {'fee%':>6}{'slip%':>7}   {'net':>13}{'PF':>7}{'win%':>8}")
     for _, r in cs.iterrows():
         L.append(f" {r['fee_%']:>6.2f}{r['slippage_%']:>7.2f}   {r['net']:>+13,.2f}{_pf_str(r['pf']):>7}{r['win%']:>8.1f}")
@@ -227,7 +227,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target-atr", type=float, default=1.8)
     ap.add_argument("--min-room-atr", type=float, default=2.0)
     ap.add_argument("--fee-pct", type=float, default=0.10)
-    ap.add_argument("--slippage-pct", type=float, default=0.02)
+    ap.add_argument("--slippage-ticks", type=int, default=2,
+                    help="Slippage in MINTICKS per fill (matches the Pine strategy default)")
+    ap.add_argument("--tick", type=float, default=None, help="Symbol mintick (default: auto from CSV)")
+    ap.add_argument("--slippage-pct", type=float, default=None, help="Explicit %% (overrides ticks)")
     args = ap.parse_args(argv)
 
     df = D.load_csv(args.csv)
@@ -238,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
             p.scalp_thr = args.threshold
         else:
             p.rev_thr = args.threshold
-    mech = Mechanics(fee_pct=args.fee_pct, slippage_pct=args.slippage_pct)
+    slip_pct, slip_label = resolve_slippage(df, args.slippage_pct, args.slippage_ticks, args.tick)
+    mech = Mechanics(fee_pct=args.fee_pct, slippage_pct=slip_pct)
     sig = compute_signals(df, p)
     trades, _, _ = run_backtest(df, sig, p, mech)
     print(diagnose(df, trades, sig, p, mech))

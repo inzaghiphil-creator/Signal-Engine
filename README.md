@@ -137,7 +137,7 @@ python -m backtester.sample_data --out data/sample_near_5m_synth.csv --days 100
 python -m backtester --csv data/sample_near_5m_synth.csv --mode scalp
 
 # your real export (TradingView or KuCoin format — see data/README.md)
-python -m backtester --csv data/near_5m.csv --mode scalp --fee-pct 0.1 --slippage-pct 0.02
+python -m backtester --csv data/near_5m.csv --mode scalp   # slippage auto = 2 minticks from the CSV's price precision
 python -m backtester --csv data/near_5m.csv --mode reversal --out-trades data/trades.csv
 python tests/smoke_test.py   # non-repainting truncation test + engine invariants
 ```
@@ -150,8 +150,10 @@ CLI mirrors the Pine settings: `--mode`, `--threshold`, `--stop-atr`,
 (run `python -m backtester --help`).
 
 **Equivalence with the Pine strategy:** entry at signal-bar close, slippage
-on **all fills** (entries and exits, adverse direction), stop-before-target
-tie-break, gap fills at the open, same fee model, same 10%-of-equity sizing.
+on **all fills** (entries and exits, adverse direction) at the *same tick
+count* (default 2 minticks — resolved per symbol from the export, matching
+the strategy's `Slippage (ticks)` input), stop-before-target tie-break, gap
+fills at the open, same fee model, same 10%-of-equity sizing.
 Known minor deltas are listed in `docs/SIGNAL_SPEC.md` §11.
 
 ### Validation tooling (analysis only — no model changes)

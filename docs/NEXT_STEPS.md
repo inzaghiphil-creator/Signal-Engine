@@ -22,16 +22,22 @@ it looks on the other window.
 
 ### 1. Real NEAR data (BLOCKING — nothing else is meaningful before this)
 
-Target file: **NEARUSDT.P (KuCoin, as charted in TradingView) 5m OHLCV**
+Target file: **NEAR/USDT (Binance spot) 5m OHLCV** — the symbol as charted
+in TradingView (the chart's feed is the single source of truth).
 
 - Range: **2026-06-15 00:00 → 2026-10-11 00:00 UTC** (≈32k bars). The
   2026-06-15 start gives ~1500 bars of indicator warmup headroom before the
   2026-07-01 study start; the end captures the Oct 8–9 crash plus recovery.
+  The chart must be zoomed/set to this full range before exporting (the
+  current 9-day view is not enough).
 - Export: TradingView → 5m chart → toolbar **Export chart data → CSV**
   (format already accepted by `backtester.data.load_csv`).
 - Save as `data/near_5m_real.csv` (git-ignored — real data stays local).
 - **Why TradingView's own export:** item 4 compares Pine vs Python; using the
   same feed for both removes data-source disagreement as a variable.
+- **Costs for this symbol:** fee 0.10%/side (Binance spot taker); slippage
+  2 minticks = 2 × 0.001 ≈ **0.038%/fill** at ~$5.2 — the CLI resolves this
+  automatically from the CSV's price precision (3 dp → tick 0.001).
 - Validate first:
   ```bash
   python -m backtester.check_data --csv data/near_5m_real.csv \
@@ -127,6 +133,12 @@ has no edge.
 
 ## Status
 
+- [x] Indicator rendered on TradingView (real NEAR/USDT 5m, 2026-10-11
+      screenshot): green up-triangles below bars / red down-triangles above
+      bars — the Signal Engine's BUY/SELL marker style (confirm if those are
+      ours). The Oct 8→9 crash (≈5.85 → ≈4.3, ~−26%, 3–5× volume spike) and
+      recovery to ≈5.23 are in view; dense red cluster through the crash,
+      long signals forming near the bottom.
 - [ ] Real data file in place + `check_data` PASS (with crash window confirmed)
 - [ ] `diagnose` run + dominant failure bucket identified (per mode)
 - [ ] `oos` single-pass result per mode, gates evaluated
