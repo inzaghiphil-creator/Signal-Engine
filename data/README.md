@@ -43,19 +43,3 @@ action; never cite its metrics as performance evidence.
 
 `.csv` files here are data artifacts: regenerate or re-export as needed; they
 are intentionally small enough to keep in git for reproducibility of tests.
-
-## Real NEAR data (validation cycle)
-
-For the real-data validation cycle (`docs/NEXT_STEPS.md`):
-
-- **NEAR/USDT (Binance spot) 5m**, TradingView "Export chart data" CSV, range
-  **2026-06-15 → 2026-10-11 UTC** (≈32k bars, includes the Oct 8–9 crash +
-  recovery), saved as `data/near_5m_real.csv`.
-- Real exports are **git-ignored** (`data/*_real*.csv`) — they stay local.
-- Validate before anything else:
-  `python -m backtester.check_data --csv data/near_5m_real.csv --window 2026-10-08,2026-10-10`
-
-KuCoin's public candles endpoint (used if TradingView export is
-inconvenient) only returns ~a limited history window and this sandbox
-cannot reach it — a TradingView export is the canonical source for this
-cycle, because the TradingView-vs-Python comparison must use one feed.
