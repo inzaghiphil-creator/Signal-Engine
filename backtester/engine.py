@@ -31,7 +31,7 @@ class Mechanics:
     slippage_pct: float = 0.02   # percent of price per fill (≈2 ticks @0.0001)
 
 
-def run_backtest(base: pd.DataFrame, sig: Signals, p: Params, mech: Mechanics) -> tuple[pd.DataFrame, pd.Series]:
+def run_backtest(base: pd.DataFrame, sig: Signals, p: Params, mech: Mechanics) -> tuple[pd.DataFrame, pd.Series, dict | None]:
     """Returns (trades DataFrame, equity curve indexed by trade close time)."""
     o = base["open"].to_numpy()
     h = base["high"].to_numpy()

@@ -18,6 +18,7 @@ from backtester.report import compute_metrics, render_report  # noqa: E402
 from backtester.sample_data import generate  # noqa: E402
 from backtester.signals import Params, compute_signals  # noqa: E402
 from backtester import indicators as I  # noqa: E402
+from backtester import check_data, diagnose as DIAG, oos as OOS, compare as CMP  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -190,6 +191,63 @@ def main() -> int:
 
     # ── V2: per-side stats present ───────────────────────────────────────
     check("per-side stats in report", "LONG" in rep and "SHORT" in rep and "Avg bars held" in rep)
+
+    # ── V2.1: data quality gate ──────────────────────────────────────────
+    a = check_data.audit(df)
+    check("check_data passes on clean data",
+          a["missing"] == 0 and a["duplicates"] == 0 and a["ohlc_violations"] == 0
+          and a["nan_prices"] == 0 and a["nonpositive_volume"] == 0)
+    w = check_data.window_stats(df, df.index[0], df.index[500])
+    check("window stats computed", w is not None and w["bars"] == 501)
+
+    # ── V2.1: loss diagnosis ─────────────────────────────────────────────
+    d = DIAG.classify(trades, df, sig, p)
+    ok = (len(d) == len(trades)
+          and d["fail_reason"].notna().all()
+          and set(d["fail_reason"]) <= {"COST-DOMINATED", "NOISE STOP", "FAILED BREAKOUT",
+                                        "PREMATURE REVERSAL", "REVERSAL EXIT (trend held)",
+                                        "STOP (developed)", "TARGET", "REVERSAL EXIT",
+                                        "TREND FLIP", "LOW-VOL CHOP"}
+          and d["mfe_r"].ge(0).all())
+    check("diagnosis classifies every trade", bool(ok))
+    cs = DIAG.cost_sensitivity(trades, df)
+    base = cs[(cs["fee_%"] == mech.fee_pct) & (cs["slippage_%"] == mech.slippage_pct)].iloc[0]
+    actual_net = float(trades["net"].sum())
+    check("cost-sensitivity base cell == actual net",
+          abs(base["net"] - actual_net) < max(1.0, 0.005 * abs(actual_net)),
+          f"base={base['net']} actual={actual_net}")
+    rep_d = DIAG.diagnose(df, trades, sig, p, mech)
+    check("diagnosis report renders", "FAILURE TAXONOMY" in rep_d and "COST SENSITIVITY" in rep_d)
+
+    # ── V2.1: out-of-sample protocol ─────────────────────────────────────
+    out_oos = OOS.oos(df, "SCALP", df.index[len(df) * 2 // 3].normalize(), min_trades=30, top_n=3)
+    check("OOS protocol runs and evaluates gates",
+          "ACCEPTANCE GATES" in out_oos and "TEST-WINDOW CONSISTENCY" in out_oos
+          and out_oos.count("PASS") + out_oos.count("FAIL") >= 6)
+
+    # ── V2.1: TradingView compare (self-consistency) ─────────────────────
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        pyf = os.path.join(td, "py.csv")
+        tvf = os.path.join(td, "tv.csv")
+        trades.to_csv(pyf, index=False)
+        rng = np.random.default_rng(3)
+        tv = pd.DataFrame({
+            "Date/Time (open)": trades["entry_time"].astype(str),
+            "Type": np.where(trades["side"] == "LONG", "Buy", "Sell"),
+            "Price": trades["entry"].to_numpy() + rng.integers(1, 4, size=len(trades)) * 0.0001,
+            "Contracts": trades["qty"].to_numpy(),
+            "Closed Date/Time": trades["exit_time"].astype(str),
+            "P&L": trades["net"].to_numpy(),
+        })
+        tv.to_csv(tvf, index=False)
+        tv_loaded = CMP.load_tv_trades(tvf, 300, "UTC")
+        py_loaded = pd.read_csv(pyf)
+        py_loaded["entry_time"] = pd.to_datetime(py_loaded["entry_time"], utc=True)
+        py_loaded["exit_time"] = pd.to_datetime(py_loaded["exit_time"], utc=True)
+        out_cmp = CMP.compare(py_loaded, tv_loaded, 300, 1, 0.05)
+        check("compare matches self-generated TV export", "VERDICT: MATCH" in out_cmp
+              and "side mismatches: 0" in out_cmp)
 
     print()
     if FAILURES:

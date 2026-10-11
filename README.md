@@ -154,6 +154,22 @@ on **all fills** (entries and exits, adverse direction), stop-before-target
 tie-break, gap fills at the open, same fee model, same 10%-of-equity sizing.
 Known minor deltas are listed in `docs/SIGNAL_SPEC.md` §11.
 
+### Validation tooling (analysis only — no model changes)
+
+```bash
+# data quality gate (run first on any real export)
+python -m backtester.check_data --csv data/near_5m_real.csv --window 2026-10-08,2026-10-10
+# loss taxonomy: WHY did losing trades happen (MFE/MAE, cost sensitivity)
+python -m backtester.diagnose --csv data/near_5m_real.csv --mode scalp
+# out-of-sample: optimise on train, validate once on test
+python -m backtester.oos --csv data/near_5m_real.csv --mode scalp --train-end 2026-08-31
+# TradingView strategy export vs Python trades
+python -m backtester.compare --py-trades py_trades.csv --tv-trades tv_trades.csv
+```
+
+The current development cycle (real data, loss diagnosis, OOS, TradingView
+verification, acceptance gates) is specified in **`docs/NEXT_STEPS.md`**.
+
 ### Running the non-repainting check
 
 `tests/smoke_test.py` includes a **truncation test**: signals computed on
