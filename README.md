@@ -144,11 +144,14 @@ python tests/smoke_test.py   # non-repainting truncation test + engine invariant
 
 CLI mirrors the Pine settings: `--mode`, `--threshold`, `--stop-atr`,
 `--target-atr`, `--min-room-atr`, `--fee-pct`, `--slippage-pct`, `--qty-pct`,
-`--no-strict-trend`, `--vwap-gate`, `--no-block-abnormal`, … (run
-`python -m backtester --help`).
+`--no-strict-trend`, `--vwap-gate`, `--no-block-abnormal`, `--out-trades`,
+`--out-signals` (per-bar scores/signals/regime CSV), `--check-norepaint`
+(truncation test on your own data — exits non-zero on any mismatch), …
+(run `python -m backtester --help`).
 
-**Equivalence with the Pine strategy:** entry at signal-bar close ± slippage,
-stop-before-target tie-break, same fee model, same 10%-of-equity sizing.
+**Equivalence with the Pine strategy:** entry at signal-bar close, slippage
+on **all fills** (entries and exits, adverse direction), stop-before-target
+tie-break, gap fills at the open, same fee model, same 10%-of-equity sizing.
 Known minor deltas are listed in `docs/SIGNAL_SPEC.md` §11.
 
 ### Running the non-repainting check
@@ -184,3 +187,47 @@ automation can route accordingly.
 5. Only after validation: extend the JSON alerts toward KuCoin automation
    (the payload already carries entry/stop/target, score, regime and position
    state — nothing order-related, by design, in this release).
+
+---
+
+## Changelog
+
+### v2.0.0
+
+**Correctness fixes (found by adversarial self-review):**
+
+- **Gates silently disabled (Python)** — the regime/VWAP/room gates used
+  `~` (bitwise NOT) on Python bools, where `~True == -2` (truthy), so every
+  gate evaluated to `True` and never filtered anything. Fixed to logical
+  `not`; now covered by dedicated tests (room filter, abnormal-vol block,
+  VWAP gate invariants). Pine was unaffected (`not` is logical in Pine).
+- **Exit fills had no slippage (Python)** — slippage was applied to entries
+  only, unlike the Pine strategy tester which slips every fill. Now applied
+  to all fills in all implementations; spec §8/§9 updated.
+- **Stale stop/target display in the Pine strategy** — after a stop/target
+  fill the table kept showing the previous levels; levels are now cleared
+  when flat, and the JSON exit alert infers STOP/TARGET from bar OHLC vs the
+  pending levels (the strategy API does not expose close reasons).
+
+**Upgrades:**
+
+- Pine data layer split into role-specific packs — 45m trend: 5 fields,
+  15m momentum: 14, 5m entry: 29 (was one 35-field pack fetched three
+  times) — lower compile cost and a clearer contract per TF.
+- Python per-TF frames built by role (trend/mid/entry) — fewer wasted
+  indicator passes.
+- Report: per-direction (LONG/SHORT) stats, average bars held, and an
+  explicit "open position at data end" note (excluded from stats, as in
+  the strategy tester).
+- New CLI: `--out-signals` (per-bar scores/signals/regime export) and
+  `--check-norepaint` (truncation test on your own data).
+- Test suite: 26 checks — added exact exit-slippage recompute for every
+  trade, filter invariants, gap-fill unit test (forced signal), no-trend-flip
+  in reversal mode, open-position reporting.
+- Alert JSON schema version bumped to `2.0.0`.
+
+### v1.0.0
+
+Initial release: multi-timeframe weighted-scoring indicator (SCALP +
+REVERSAL), equivalent strategy with regime attribution, Python backtester,
+webhook-ready JSON alerts, synthetic sample + smoke tests.

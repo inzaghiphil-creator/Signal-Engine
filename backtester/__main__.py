@@ -7,6 +7,9 @@ from __future__ import annotations
 import argparse
 import sys
 
+import numpy as np
+import pandas as pd
+
 from . import __version__
 from . import data as D
 from .engine import Mechanics, run_backtest
@@ -50,8 +53,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = ap.add_argument_group("output")
     g.add_argument("--out-trades", default=None, help="Write trades to CSV at this path")
+    g.add_argument("--out-signals", default=None,
+                   help="Write per-bar scores/signals/regime CSV at this path")
+    g.add_argument("--check-norepaint", action="store_true",
+                   help="Truncation test: recompute on a prefix and assert scores, "
+                        "signals and regime are identical (exit 1 on any mismatch)")
     ap.add_argument("--version", action="version", version=f"backtester {__version__}")
     return ap
+
+
+def _check_norepaint(df: pd.DataFrame, p: Params) -> bool:
+    """Recompute signals on prefixes; scores/signals/regime must be identical
+    on the overlapping bars (confirmed HTF data only → no repaint)."""
+    n = len(df)
+    cuts = sorted({int(n * f) for f in (0.5, 0.75) if int(n * f) < n})
+    base_sig = compute_signals(df, p)
+    ok = True
+    for n2 in cuts:
+        if n2 >= n:
+            continue
+        sub = df.iloc[:n2].copy()
+        sig2 = compute_signals(sub, p)
+        for col, full, part in (
+            ("score_long", base_sig.score_long, sig2.score_long),
+            ("score_short", base_sig.score_short, sig2.score_short),
+            ("long_sig", base_sig.long_sig, sig2.long_sig),
+            ("short_sig", base_sig.short_sig, sig2.short_sig),
+        ):
+            a, b = full.iloc[:n2].to_numpy(), part.to_numpy()
+            if not bool(np.array_equal(a, b, equal_nan=True)):
+                print(f"[norepaint] MISMATCH {col} after bar {n2}")
+                ok = False
+        a, b = base_sig.regime_label.iloc[:n2].fillna("").to_numpy(), sig2.regime_label.fillna("").to_numpy()
+        if not (a == b).all():
+            print(f"[norepaint] MISMATCH regime_label after bar {n2}")
+            ok = False
+    if ok:
+        print(f"[norepaint] PASS — scores, signals and regime identical on truncated prefixes "
+              f"(cuts: {[c for c in cuts if c < n]})")
+    return ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,8 +137,25 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sig = compute_signals(df, p)
-    trades, equity = run_backtest(df, sig, p, mech)
-    m = compute_metrics(trades, equity, p, mech)
+    trades, equity, open_pos = run_backtest(df, sig, p, mech)
+
+    if args.out_signals:
+        out = pd.DataFrame(
+            {
+                "score_long": sig.score_long.round(1),
+                "score_short": sig.score_short.round(1),
+                "rev_score_long": sig.rev_score_long.round(1),
+                "rev_score_short": sig.rev_score_short.round(1),
+                "long_sig": sig.long_sig.astype(int),
+                "short_sig": sig.short_sig.astype(int),
+                "regime": sig.regime_label,
+                "bias_45": sig.bias45,
+            },
+            index=df.index,
+        )
+        out.index.name = "time"
+        out.to_csv(args.out_signals)
+        print(f"signals written to {args.out_signals}")
 
     data_info = {
         "label": args.label or args.csv,
@@ -107,7 +164,14 @@ def main(argv: list[str] | None = None) -> int:
         "start": df.index[0].strftime("%Y-%m-%d %H:%M"),
         "end": df.index[-1].strftime("%Y-%m-%d %H:%M"),
     }
-    print(render_report(m, p, mech, data_info))
+
+    if args.check_norepaint:
+        ok = _check_norepaint(df, p)
+        if not ok:
+            return 1
+
+    m = compute_metrics(trades, equity, p, mech)
+    print(render_report(m, p, mech, data_info, open_pos))
 
     if args.out_trades and not trades.empty:
         trades.to_csv(args.out_trades, index=False)

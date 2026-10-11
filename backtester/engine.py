@@ -1,11 +1,16 @@
 """Trade engine — mirrors the Pine strategy exactly.
 
 Execution convention (shared by Pine strategy, indicator display and here):
-  • Entry at the CLOSE of the signal bar, with slippage applied.
+  • Entry at the CLOSE of the signal bar; slippage applied to ALL fills
+    (entries and exits, adverse direction) — matching the Pine strategy
+    tester, which applies slippage to every execution.
   • Stop = entry ∓ stop_atr × ATR(signal bar); target = entry ± tgt_atr × ATR.
   • Per-bar management order: STOP → TARGET → REVERSAL → TREND FLIP → entry.
     STOP is checked before TARGET on the same bar (conservative tie-break).
-  • Gaps: if the bar opens beyond the stop/target, fill at the open.
+  • Gaps: if the bar opens beyond the stop/target, fill at the open
+    (then slippage on that fill).
+  • A new position's first exit check happens on the bar AFTER entry
+    (matches the strategy's exit order becoming active the next bar).
   • Fees: fee_pct per side on notional; position = qty_pct of current equity.
 """
 from __future__ import annotations
@@ -56,8 +61,13 @@ def run_backtest(base: pd.DataFrame, sig: Signals, p: Params, mech: Mechanics) -
     trades: list[dict] = []
     equity_points: list[tuple[pd.Timestamp, float]] = [(idx[0], equity)]
 
-    def close_trade(i: int, reason: str, px: float) -> None:
+    def slip_fill(px: float) -> float:
+        """Adverse-direction slippage on any fill (long exits lower, short exits higher)."""
+        return px * (1.0 - slip) if pos == 1 else px * (1.0 + slip)
+
+    def close_trade(i: int, reason: str, px_raw: float) -> None:
         nonlocal equity, pos
+        px = slip_fill(px_raw)
         if pos == 1:
             gross = (px - entry_px) * qty
         else:
@@ -129,8 +139,18 @@ def run_backtest(base: pd.DataFrame, sig: Signals, p: Params, mech: Mechanics) -
                 entry_score = score_s[i] if p.is_scalp else score_rs[i]
                 pos = -1
 
-    # an open position at the end of data is left out of closed-trade stats
-    # (same as the Pine strategy tester's "open" position)
+    # an open position at the end of data is reported separately and excluded
+    # from closed-trade stats (same as the Pine strategy tester's "open" position)
+    open_pos = None
+    if pos != 0:
+        open_pos = {
+            "side": "LONG" if pos == 1 else "SHORT",
+            "entry_time": idx[entry_i],
+            "entry": round(entry_px, 8),
+            "stop": round(stop, 8),
+            "target": round(tgt, 8),
+            "last_close": round(float(c[-1]), 8),
+        }
     trades_df = pd.DataFrame(trades)
     eq = pd.Series([v for _, v in equity_points], index=pd.DatetimeIndex([t for t, _ in equity_points]), name="equity")
-    return trades_df, eq
+    return trades_df, eq, open_pos

@@ -100,12 +100,42 @@ def _pts(cond: pd.Series) -> pd.Series:
     return cond.fillna(False).astype(float)
 
 
-def build_tf_frame(df: pd.DataFrame, p: Params) -> pd.DataFrame:
-    """Per-TF indicator columns — the same 35 fields Pine's f_pack returns,
-    computed directly on that TF's bars."""
+def build_tf_frame(df: pd.DataFrame, p: Params, role: str = "entry") -> pd.DataFrame:
+    """Per-TF indicator columns, computed directly on that TF's bars.
+
+    Mirrors the Pine packs — only the fields each role actually uses:
+      trend: c, ef, em, es, et                                   (5)
+      mid:   + rsi, rsip, mh, mhp, dip, dim, adx, ap, apavg     (14)
+      entry: full set (OHLCV, slopes, rsi, macd, cross ages, atr,
+             vavg, pivots, vwap)                                 (30)
+    """
     c = df["close"]
     f = pd.DataFrame(index=df.index)
     f["c"] = c
+    ef = I.ema(c, p.ema_fast)
+    em = I.ema(c, p.ema_mid)
+    es = I.ema(c, p.ema_slow)
+    et = I.ema(c, p.ema_trend)
+    f["ef"], f["em"], f["es"], f["et"] = ef, em, es, et
+
+    if role == "trend":
+        return f
+
+    rsi = I.rsi(c, p.rsi_len)
+    f["rsi"] = rsi
+    f["rsip"] = rsi.shift(1)
+    ml, ms, mh = I.macd(c, p.macd_fast, p.macd_slow, p.macd_sig)
+    f["mh"], f["mhp"] = mh, mh.shift(1)
+    dip, dim, adxv = I.adx(df, p.adx_len)
+    f["dip"], f["dim"], f["adx"] = dip, dim, adxv
+    atr_s = I.atr(df, p.atr_len)
+    f["ap"] = atr_s / c * 100.0
+    f["apavg"] = f["ap"].rolling(p.vol_sma_len).mean()
+
+    if role == "mid":
+        return f
+
+    # entry role — full set
     f["o"] = df["open"]
     f["h"] = df["high"]
     f["l"] = df["low"]
@@ -113,32 +143,18 @@ def build_tf_frame(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     f["vup"] = df["volume"] > df["volume"].shift(1)
     f["pbear"] = c.shift(1) < df["open"].shift(1)
     f["pbull"] = c.shift(1) > df["open"].shift(1)
-    ef = I.ema(c, p.ema_fast)
-    em = I.ema(c, p.ema_mid)
-    es = I.ema(c, p.ema_slow)
-    et = I.ema(c, p.ema_trend)
-    f["ef"], f["em"], f["es"], f["et"] = ef, em, es, et
     f["emr"] = em > em.shift(1)
     f["esr"] = es > es.shift(1)
-    rsi = I.rsi(c, p.rsi_len)
-    f["rsi"] = rsi
-    f["rsip"] = rsi.shift(1)
-    ml, ms, mh = I.macd(c, p.macd_fast, p.macd_slow, p.macd_sig)
-    f["ml"], f["mlp"], f["mh"], f["mhp"] = ml, ml.shift(1), mh, mh.shift(1)
+    f["ml"], f["mlp"] = ml, ml.shift(1)
     f["cru_age"] = pd.Series(_barssince(_crossover(ef, em)), index=df.index)
     f["crd_age"] = pd.Series(_barssince(_crossunder(ef, em)), index=df.index)
     f["mcru_age"] = pd.Series(_barssince(_crossover(ml, ms)), index=df.index)
     f["mcrd_age"] = pd.Series(_barssince(_crossunder(ml, ms)), index=df.index)
-    f["atr"] = I.atr(df, p.atr_len)
+    f["atr"] = atr_s
     f["vavg"] = df["volume"].rolling(p.vol_len).mean()
     ph, pl = I.pivots(df, p.piv_len)
     f["pph"], f["ppl"] = ph, pl
-    dip, dim, adxv = I.adx(df, p.adx_len)
-    f["dip"], f["dim"], f["adx"] = dip, dim, adxv
-    f["ap"] = f["atr"] / c * 100.0
-    f["apavg"] = f["ap"].rolling(p.vol_sma_len).mean()
     f["vwap"] = I.session_vwap(df)
-    f["time"] = df.index.asi8 // 10**6
     return f
 
 
@@ -193,11 +209,11 @@ class Signals:
 
 def compute_signals(base: pd.DataFrame, p: Params) -> Signals:
     """Full signal model. `base` = raw base-TF OHLCV (must be the entry TF)."""
-    base_f = build_tf_frame(base, p)
+    base_f = build_tf_frame(base, p, "entry")
     mid_raw = D.resample_ohlcv(base, p.tf_mid_s)
     htf_raw = D.resample_ohlcv(base, p.tf_htf_s)
-    mid_f = build_tf_frame(mid_raw, p)
-    htf_f = build_tf_frame(htf_raw, p)
+    mid_f = build_tf_frame(mid_raw, p, "mid")
+    htf_f = build_tf_frame(htf_raw, p, "trend")
     mid_a = D.align_htf(base.index, mid_f, p.tf_base_s, p.tf_mid_s).reindex(base.index)
     htf_a = D.align_htf(base.index, htf_f, p.tf_base_s, p.tf_htf_s).reindex(base.index)
 
@@ -392,11 +408,15 @@ def compute_signals(base: pd.DataFrame, p: Params) -> Signals:
     # ── gates ─────────────────────────────────────────────────────────────
     room_long = np.where(ph_valid & (last_ph > c_e), last_ph - c_e, BIG)
     room_short = np.where(pl_valid & (last_pl < c_e), c_e - last_pl, BIG)
-    regime_ok = (~p.block_abnormal) | (regime != 3)
-    vwap_long_ok = (~p.vwap_gate) | (e["c"] > e["vwap"])
-    vwap_short_ok = (~p.vwap_gate) | (e["c"] < e["vwap"])
-    room_long_ok = (~p.require_room) | (room_long >= p.min_room_atr * atr_e)
-    room_short_ok = (~p.require_room) | (room_short >= p.min_room_atr * atr_e)
+    # NOTE: use `not` (logical). `~` on a Python bool is BITWISE NOT —
+    # ~True == -2 and ~False == -1, both truthy — which silently turns every
+    # gate into `True` (caught by the filter tests in V2.0).
+    atr_e_np = atr_e.to_numpy()
+    regime_ok = pd.Series((not p.block_abnormal) or (regime != 3), index=base.index)
+    vwap_long_ok = pd.Series((not p.vwap_gate) or (e["c"] > e["vwap"]), index=base.index)
+    vwap_short_ok = pd.Series((not p.vwap_gate) or (e["c"] < e["vwap"]), index=base.index)
+    room_long_ok = pd.Series((not p.require_room) or (room_long >= p.min_room_atr * atr_e_np), index=base.index)
+    room_short_ok = pd.Series((not p.require_room) or (room_short >= p.min_room_atr * atr_e_np), index=base.index)
     trend_long_ok = (trend45 == 1) if p.strict_trend else (trend45 != -1)
     trend_short_ok = (trend45 == -1) if p.strict_trend else (trend45 != 1)
     rev_long_ok = trend45 != 1

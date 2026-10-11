@@ -1,4 +1,4 @@
-# SIGNAL SPEC v1.0.0 — canonical signal model
+# SIGNAL SPEC v2.0.0 — canonical signal model
 
 This document is the **single source of truth** for the entry/exit logic.
 Three implementations must stay in sync with it:
@@ -136,7 +136,10 @@ A signal that fails any gate is **not** actionable (table shows why).
 
 ## 8. Trade management
 
-- Entry: signal-bar close ± slippage (Pine strategy: `process_orders_on_close`).
+- Entry: signal-bar close, **slippage applied to ALL fills** (entry and exit,
+  adverse direction) — the Python backtester matches the Pine strategy tester,
+  which applies slippage to every execution (Pine strategy:
+  `process_orders_on_close`).
 - Stop  = entry ∓ 1.2 × ATR(signal bar) · Target = entry ± 1.8 × ATR
 - Per-bar management order (all implementations):
   1. STOP (checked before target — conservative tie-break)
@@ -152,8 +155,11 @@ A signal that fails any gate is **not** actionable (table shows why).
 ## 9. Costs (strategy / backtester)
 
 - Fee 0.10% per side (KuCoin taker, configurable)
-- Slippage 2 ticks (≈0.02% at 0.0001 tick, configurable)
+- Slippage 2 ticks (≈0.02% at 0.0001 tick, configurable) — applied to **all
+  fills** (entries and exits, adverse direction) in every implementation
 - Position = 10% of equity (configurable), initial capital 10,000
+- An open position at the end of data is excluded from closed-trade stats
+  (same as the strategy tester's open position) and reported separately
 
 ## 10. Alerts (webhook JSON)
 
@@ -162,7 +168,7 @@ Events: `BUY`, `SELL`, `EXIT_LONG`, `EXIT_SHORT`, `TREND_CHANGE`,
 
 ```json
 {
-  "source": "signal-engine", "version": "1.0.0", "event": "BUY", "side": "LONG",
+  "source": "signal-engine", "version": "2.0.0", "event": "BUY", "side": "LONG",
   "mode": "SCALP", "symbol": "NEAR-USDT",
   "time_ms": 1789000000000, "time": "2026-10-10T06:25:00Z", "entry_tf": "5",
   "score": 85, "threshold": 80,
@@ -181,9 +187,11 @@ signals only; no order routing.
 
 ## 11. Known simplifications / deltas
 
-- Pine strategy exit *reason* in the JSON for STOP/TARGET fills points at the
-  strategy tester (the reason is implicit in the fill price); the indicator's
-  paper tracker and the Python engine report exact reasons.
+- Pine strategy: the strategy API does not expose *why* a stop/limit order
+  filled, so STOP/TARGET exit reasons are **inferred** from bar OHLC vs the
+  pending levels (stop checked first — same conservative rule as the Python
+  engine). In a bar that touches both, the inferred reason always says STOP;
+  the indicator's paper tracker and the Python engine report the same.
 - Same-bar stop+target ambiguity: stop wins (all implementations).
 - Indicator paper tracker PnL is pre-fee; the strategy/backtester are
   post-fee.

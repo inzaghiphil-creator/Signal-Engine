@@ -2,7 +2,7 @@
 // https://www.mozilla.org/MPL/2.0/
 //
 // ─────────────────────────────────────────────────────────────────────────────
-//  NEAR SIGNAL ENGINE v1.0 — multi-timeframe weighted-scoring indicator
+//  NEAR SIGNAL ENGINE v2.0 — multi-timeframe weighted-scoring indicator
 //  Pine Script v6 · TradingView
 //
 //  MODES
@@ -28,8 +28,8 @@
 //
 //  ALERTS
 //    BUY, SELL, EXIT LONG, EXIT SHORT, TREND CHANGE, REGIME CHANGE —
-    webhook-compatible JSON via alert(), plus classic alertcondition()
-    entries. SIGNALS AND ALERTS ONLY — no order execution, ever.
+//    webhook-compatible JSON via alert(), plus classic alertcondition()
+//    entries. SIGNALS AND ALERTS ONLY — no order execution, ever.
 //
 //  SYNC — the entry logic in this file must stay identical to
 //    pine/signal_engine_strategy.pine  and  backtester/ (Python).
@@ -132,8 +132,16 @@ inJsonAlerts = input.bool(true, "Webhook JSON payload", group = "Alerts", toolti
 // non-repainting multi-timeframe pattern.
 // ════════════════════════════════════════════════════════════════════════════
 
-f_pack(src, o, h, l, v) =>
-    // local series (evaluated in the requested-TF context)
+f_pack_trend(src) =>
+    [
+        src[1],
+        ta.ema(src, inEmaFast)[1],
+        ta.ema(src, inEmaMid)[1],
+        ta.ema(src, inEmaSlow)[1],
+        ta.ema(src, inEmaTrend)[1]
+    ]
+
+f_pack_mom(src, h, l) =>
     e9s = ta.ema(src, inEmaFast)
     e21s = ta.ema(src, inEmaMid)
     e55s = ta.ema(src, inEmaSlow)
@@ -144,7 +152,6 @@ f_pack(src, o, h, l, v) =>
     macdHist = macdLine - macdSig
     atrS = ta.atr(inAtrLen)
     atrPctS = src > 0 ? atrS / src * 100 : 0.0
-    volsS = ta.sma(v, inVolLen)
     upMove = h - h[1]
     dnMove = l[1] - l
     plusDM = upMove > dnMove and upMove > 0 ? upMove : 0.0
@@ -156,13 +163,44 @@ f_pack(src, o, h, l, v) =>
     diSum = diPlusS + diMinusS
     dxS = diSum > 0 ? 100 * math.abs(diPlusS - diMinusS) / diSum : 0.0
     adxS = ta.rma(dxS, inAdxLen)
+    [
+        src[1],
+        e9s[1],
+        e21s[1],
+        e55s[1],
+        e200s[1],
+        rsiS[1],
+        rsiS[2],
+        macdHist[1],
+        macdHist[2],
+        diPlusS[1],
+        diMinusS[1],
+        adxS[1],
+        atrPctS[1],
+        ta.sma(atrPctS, inVolSmaLen)[1]
+    ]
+
+f_pack_entry(src, o, h, l, v) =>
+    e9s = ta.ema(src, inEmaFast)
+    e21s = ta.ema(src, inEmaMid)
+    e55s = ta.ema(src, inEmaSlow)
+    e200s = ta.ema(src, inEmaTrend)
+    rsiS = ta.rsi(src, inRsiLen)
+    macdLine = ta.ema(src, inMacdFast) - ta.ema(src, inMacdSlow)
+    macdSig = ta.ema(macdLine, inMacdSig)
+    macdHist = macdLine - macdSig
+    atrS = ta.atr(inAtrLen)
+    volsS = ta.sma(v, inVolLen)
     emaCrUp = ta.crossover(e9s, e21s)
     emaCrDn = ta.crossunder(e9s, e21s)
     macdCrUp = ta.crossover(macdLine, macdSig)
     macdCrDn = ta.crossunder(macdLine, macdSig)
+    bsCrUp = ta.barssince(emaCrUp)
+    bsCrDn = ta.barssince(emaCrDn)
+    bsMcrUp = ta.barssince(macdCrUp)
+    bsMcrDn = ta.barssince(macdCrDn)
     phS = ta.pivothigh(h, inPivLen, inPivLen)
     plS = ta.pivotlow(l, inPivLen, inPivLen)
-    // tuple — every field is confirmed data (35 fields)
     [
         src[1],
         o[1],
@@ -184,31 +222,26 @@ f_pack(src, o, h, l, v) =>
         macdLine[2],
         macdHist[1],
         macdHist[2],
-        ta.barssince(emaCrUp)[1],
-        ta.barssince(emaCrDn)[1],
-        ta.barssince(macdCrUp)[1],
-        ta.barssince(macdCrDn)[1],
+        bsCrUp[1],
+        bsCrDn[1],
+        bsMcrUp[1],
+        bsMcrDn[1],
         atrS[1],
         volsS[1],
         phS[1],
         plS[1],
-        diPlusS[1],
-        diMinusS[1],
-        adxS[1],
-        atrPctS[1],
-        ta.sma(atrPctS, inVolSmaLen)[1],
         ta.vwap(hlc3)[1],
         time[1]
     ]
 
-// ── Trend TF (bias) ─────────────────────────────────────────────────────────
-[c45, o45, h45, l45, v45, vUp45, pBear45, pBull45, eF45, eM45, eMr45, eS45, eSr45, eT45, rsi45, rsiP45, ml45, mlP45, mh45, mhP45, crUpA45, crDnA45, mcrUpA45, mcrDnA45, atr45, vAvg45, ph45, pl45, diP45, diM45, adx45, ap45, apAvg45, vw45, t45] = request.security(syminfo.tickerid, inHtf, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+// ── Trend TF (bias) — 5 confirmed fields ───────────────────────────────────
+[c45, eF45, eM45, eS45, eT45] = request.security(syminfo.tickerid, inHtf, f_pack_trend(close), barmerge.gaps_off, barmerge.lookahead_off)
 
-// ── Momentum TF (confirmation + regime) ─────────────────────────────────────
-[c15, o15, h15, l15, v15, vUp15, pBear15, pBull15, eF15, eM15, eMr15, eS15, eSr15, eT15, rsi15, rsiP15, ml15, mlP15, mh15, mhP15, crUpA15, crDnA15, mcrUpA15, mcrDnA15, atr15, vAvg15, ph15, pl15, diP15, diM15, adx15, ap15, apAvg15, vw15, t15] = request.security(syminfo.tickerid, inMid, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+// ── Momentum TF (confirmation + regime) — 14 confirmed fields ───────────────
+[c15, eF15, eM15, eS15, eT15, rsi15, rsiP15, mh15, mhP15, diP15, diM15, adx15, ap15, apAvg15] = request.security(syminfo.tickerid, inMid, f_pack_mom(close, high, low), barmerge.gaps_off, barmerge.lookahead_off)
 
-// ── Entry TF (execution) ────────────────────────────────────────────────────
-[cE, oE, hE, lE, vE, vUpE, pBearE, pBullE, eFE, eME, eMrE, eSE, eSrE, eTE, rsiE, rsiPE, mlE, mlPE, mhE, mhPE, crUpAE, crDnAE, mcrUpAE, mcrDnAE, atrE, vAvgE, phE, plE, diPE, diME, adxE, apE, apAvgE, vwE, tE] = request.security(syminfo.tickerid, inEntry, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+// ── Entry TF (execution) — 30 confirmed fields ──────────────────────────────
+[cE, oE, hE, lE, vE, vUpE, pBearE, pBullE, eFE, eME, eMrE, eSE, eSrE, eTE, rsiE, rsiPE, mlE, mlPE, mhE, mhPE, crUpAE, crDnAE, mcrUpAE, mcrDnAE, atrE, vAvgE, phE, plE, vwE, tE] = request.security(syminfo.tickerid, inEntry, f_pack_entry(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
 
 // ════════════════════════════════════════════════════════════════════════════
 // ENTRY-BAR EDGE LATCH
@@ -669,7 +702,7 @@ f_compRev(side) =>
 f_comp(side) =>
     isScalp ? f_compScalp(side) : f_compRev(side)
 f_json(event, side, px, scoreVal, compJson, reason) =>
-    '{"source":"signal-engine","version":"1.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(nz(tE), "0") + ',"time":"' + str.format_time(nz(tE), "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (pos != 0 and not na(entryPx) ? str.tostring(entryPx, format.mintick) : "null") + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
+    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(nz(tE), "0") + ',"time":"' + str.format_time(nz(tE), "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (pos != 0 and not na(entryPx) ? str.tostring(entryPx, format.mintick) : "null") + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
 
 if inAlerts and inJsonAlerts and longSig
     alert(f_json("BUY", "LONG", cE, isScalp ? scoreLongTotal : revScoreLongTotal, f_comp(1), "score " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
