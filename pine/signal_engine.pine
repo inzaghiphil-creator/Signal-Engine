@@ -1,0 +1,697 @@
+// This source file is subject to the terms of the Mozilla Public License 2.0
+// https://www.mozilla.org/MPL/2.0/
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  NEAR SIGNAL ENGINE v1.0 — multi-timeframe weighted-scoring indicator
+//  Pine Script v6 · TradingView
+//
+//  MODES
+//    SCALP    trend-following breakout (with 45m alignment requirement)
+//    REVERSAL countertrend rejection (requires rejection + weakening momentum)
+//
+//  DESIGN (non-repainting guarantees)
+//    • Every higher-timeframe value is the LAST CONFIRMED bar of that TF,
+//      fetched with barmerge.gaps_off + barmerge.lookahead_off and [1]
+//      inside the security expression.
+//    • Entry-TF conditions are evaluated on the last CONFIRMED entry bar.
+//      A signal is latched once per entry bar (edge on confirmed bar time),
+//      so arrows/labels are drawn on the signal candle and NEVER move.
+//    • No future data, no intrabar repainting, no disappearing arrows.
+//
+//  SIGNALS
+//    Weighted 100-point confidence score, configurable thresholds (80 scalp /
+//    70 reversal by default), market-regime gate, VWAP gate (optional),
+//    and a reward/risk ROOM filter (distance to next pivot S/R must justify
+//    stop + target + fees). ATR(14)-based stop (1.2×) and target (1.8×).
+//    A lightweight paper position tracker raises EXIT LONG / EXIT SHORT
+//    events (STOP / TARGET / REVERSAL / TREND FLIP).
+//
+//  ALERTS
+//    BUY, SELL, EXIT LONG, EXIT SHORT, TREND CHANGE, REGIME CHANGE —
+    webhook-compatible JSON via alert(), plus classic alertcondition()
+    entries. SIGNALS AND ALERTS ONLY — no order execution, ever.
+//
+//  SYNC — the entry logic in this file must stay identical to
+//    pine/signal_engine_strategy.pine  and  backtester/ (Python).
+//  The canonical model is documented in docs/SIGNAL_SPEC.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("NEAR SIGNAL ENGINE", "NEAR SIGNAL ENGINE v1.0 [SCALP/REVERSAL]", shorttitle = "NEAR SIGNAL ENGINE", overlay = true, max_labels_count = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Mode ───────────────────────────────────────────────────────────────────
+inMode = input.string("SCALP", "Signal Mode", options = ["SCALP", "REVERSAL"], group = "Mode", tooltip = "SCALP = trend-following breakout. REVERSAL = countertrend rejection at support/resistance.")
+isScalp = inMode == "SCALP"
+
+// ── Timeframes ──────────────────────────────────────────────────────────────
+inHtf = input.timeframe("45", "Trend TF (bias)", group = "Timeframes", tooltip = "Direction / trend bias timeframe.")
+inMid = input.timeframe("15", "Momentum TF (confirmation)", group = "Timeframes", tooltip = "Momentum confirmation + regime detection timeframe.")
+inEntry = input.timeframe("5", "Entry TF (execution)", group = "Timeframes", tooltip = "Execution timeframe. Chart on this TF for aligned arrows.")
+
+// ── Indicator parameters ────────────────────────────────────────────────────
+inEmaFast = input.int(9, "EMA Fast", minval = 2, group = "Indicators")
+inEmaMid = input.int(21, "EMA Mid", minval = 2, group = "Indicators")
+inEmaSlow = input.int(55, "EMA Slow", minval = 2, group = "Indicators")
+inEmaTrend = input.int(200, "EMA Trend", minval = 2, group = "Indicators")
+inRsiLen = input.int(14, "RSI Length", minval = 2, group = "Indicators")
+inRsiWeak = input.int(40, "RSI Weak Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiMid = input.int(50, "RSI Neutral Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiStrong = input.int(60, "RSI Strong Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiOb = input.int(70, "RSI Overbought", minval = 51, maxval = 99, group = "Indicators")
+inRsiOs = input.int(30, "RSI Oversold", minval = 1, maxval = 49, group = "Indicators")
+inMacdFast = input.int(12, "MACD Fast", minval = 2, group = "Indicators")
+inMacdSlow = input.int(26, "MACD Slow", minval = 2, group = "Indicators")
+inMacdSig = input.int(9, "MACD Signal", minval = 2, group = "Indicators")
+inVolLen = input.int(20, "Volume Average Length", minval = 2, group = "Indicators")
+inVolMult = input.float(1.5, "Volume Breakout ×", minval = 0.1, step = 0.1, group = "Indicators")
+inAtrLen = input.int(14, "ATR Length", minval = 2, group = "Indicators")
+inPivLen = input.int(5, "Pivot Left/Right Bars", minval = 2, maxval = 20, group = "Indicators")
+inRecency = input.int(3, "Cross Recency (bars)", minval = 1, maxval = 20, group = "Indicators", tooltip = "A cross within this many entry-TF bars counts as a recent momentum flip.")
+
+// ── Scoring weights (SCALP) — total 100 ─────────────────────────────────────
+wT45 = input.int(20, "W: Trend (HTF)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wM15 = input.int(20, "W: Momentum (MID)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wE5 = input.int(15, "W: EMA structure (ENTRY)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wRsi = input.int(10, "W: RSI", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wMcd = input.int(10, "W: MACD", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wVol = input.int(15, "W: Volume", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wStr = input.int(10, "W: Market structure", minval = 0, maxval = 100, group = "Scoring · SCALP")
+inScalpThr = input.int(80, "SCALP minimum score", minval = 1, maxval = 100, group = "Scoring · SCALP")
+
+// ── Scoring weights (REVERSAL) — total 100 ──────────────────────────────────
+wRej = input.int(25, "W: Rejection at S/R", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wMtn = input.int(25, "W: Momentum turning", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wHwf = input.int(15, "W: HTF momentum weakening", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wFlp = input.int(10, "W: Entry-TF flip", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wRvl = input.int(15, "W: Volume", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wRst = input.int(10, "W: Structure", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+inRevThr = input.int(70, "REVERSAL minimum score", minval = 1, maxval = 100, group = "Scoring · REVERSAL")
+
+// ── Risk & filters ──────────────────────────────────────────────────────────
+inStopAtr = input.float(1.2, "Stop distance × ATR", minval = 0.1, step = 0.1, group = "Risk & Filters")
+inTgtAtr = input.float(1.8, "Target distance × ATR", minval = 0.1, step = 0.1, group = "Risk & Filters")
+inMinRoomAtr = input.float(2.0, "Min room to S/R × ATR", minval = 0.0, step = 0.1, group = "Risk & Filters", tooltip = "Longs are rejected when the nearest pivot high is closer than this × ATR (target must fit above the stop distance). 0 disables the distance check (keep the filter on to require any pivot).")
+inPivAgeMax = input.int(120, "Pivot max age (entry bars)", minval = 5, group = "Risk & Filters", tooltip = "Pivots older than this are ignored as S/R (no known level).")
+inPivFresh = input.int(15, "Pivot freshness for breakout (entry bars)", minval = 1, group = "Risk & Filters")
+inRequireRoom = input.bool(true, "Require R/R room filter", group = "Risk & Filters")
+inTrendExit = input.bool(true, "Exit on HTF trend flip", group = "Risk & Filters")
+
+// ── Market regime ───────────────────────────────────────────────────────────
+inAdxLen = input.int(14, "ADX Length", minval = 2, group = "Regime (MID TF)")
+inAdxTrend = input.float(20, "ADX trending threshold", minval = 1, group = "Regime (MID TF)")
+inVolSpike = input.float(1.8, "Abnormal vol × (ATR% vs avg)", minval = 1.0, step = 0.1, group = "Regime (MID TF)")
+inVolSmaLen = input.int(100, "ATR% average length", minval = 10, group = "Regime (MID TF)")
+inSepMin = input.float(0.15, "Min EMA mid/slow separation %", minval = 0.01, step = 0.05, group = "Regime (MID TF)")
+inBlockAbnormal = input.bool(true, "Block entries in ABNORMAL VOL regime", group = "Regime (MID TF)")
+
+// ── Entry gates ─────────────────────────────────────────────────────────────
+inStrictTrend = input.bool(true, "SCALP: require full HTF EMA alignment", group = "Gates", tooltip = "When ON, longs need 9>21>55 on the trend TF (and the mirror for shorts). When OFF, neutral alignment is also allowed.")
+inVwapGate = input.bool(false, "Require session VWAP alignment", group = "Gates", tooltip = "Longs only above session VWAP, shorts only below. Off by design — VWAP is directional bias, not an entry requirement.")
+
+// ── Display ─────────────────────────────────────────────────────────────────
+inShowTable = input.bool(true, "Show info table", group = "Display")
+inShowLabels = input.bool(true, "Show signal labels", group = "Display")
+inShowEmas = input.bool(true, "Plot EMAs (chart TF)", group = "Display")
+inShowVwap = input.bool(true, "Plot session VWAP (chart TF)", group = "Display")
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+inAlerts = input.bool(true, "Enable alert() events", group = "Alerts", tooltip = "Fires BUY / SELL / EXIT LONG / EXIT SHORT / TREND CHANGE / REGIME CHANGE at the exact moment the signal candle closes.")
+inJsonAlerts = input.bool(true, "Webhook JSON payload", group = "Alerts", tooltip = "Structured JSON for future KuCoin automation. No orders are ever sent.")
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONFIRMED-CANDLE DATA LAYER
+//
+// f_pack computes every series we need on the requested timeframe and returns
+// only values of the LAST CONFIRMED bar (each expression ends with [1], or is
+// a self-confirming pivot). request.security(..., barmerge.gaps_off,
+// barmerge.lookahead_off) + the [1] convention is the canonical
+// non-repainting multi-timeframe pattern.
+// ════════════════════════════════════════════════════════════════════════════
+
+f_pack(src, o, h, l, v) =>
+    // local series (evaluated in the requested-TF context)
+    e9s = ta.ema(src, inEmaFast)
+    e21s = ta.ema(src, inEmaMid)
+    e55s = ta.ema(src, inEmaSlow)
+    e200s = ta.ema(src, inEmaTrend)
+    rsiS = ta.rsi(src, inRsiLen)
+    macdLine = ta.ema(src, inMacdFast) - ta.ema(src, inMacdSlow)
+    macdSig = ta.ema(macdLine, inMacdSig)
+    macdHist = macdLine - macdSig
+    atrS = ta.atr(inAtrLen)
+    atrPctS = src > 0 ? atrS / src * 100 : 0.0
+    volsS = ta.sma(v, inVolLen)
+    upMove = h - h[1]
+    dnMove = l[1] - l
+    plusDM = upMove > dnMove and upMove > 0 ? upMove : 0.0
+    minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0.0
+    trS = ta.tr(h, l, src[1])
+    trRma = ta.rma(trS, inAdxLen)
+    diPlusS = trRma > 0 ? 100 * ta.rma(plusDM, inAdxLen) / trRma : 0.0
+    diMinusS = trRma > 0 ? 100 * ta.rma(minusDM, inAdxLen) / trRma : 0.0
+    diSum = diPlusS + diMinusS
+    dxS = diSum > 0 ? 100 * math.abs(diPlusS - diMinusS) / diSum : 0.0
+    adxS = ta.rma(dxS, inAdxLen)
+    emaCrUp = ta.crossover(e9s, e21s)
+    emaCrDn = ta.crossunder(e9s, e21s)
+    macdCrUp = ta.crossover(macdLine, macdSig)
+    macdCrDn = ta.crossunder(macdLine, macdSig)
+    phS = ta.pivothigh(h, inPivLen, inPivLen)
+    plS = ta.pivotlow(l, inPivLen, inPivLen)
+    // tuple — every field is confirmed data (35 fields)
+    [
+        src[1],
+        o[1],
+        h[1],
+        l[1],
+        v[1],
+        v[1] > v[2] ? true : false,
+        src[2] < o[2] ? true : false,
+        src[2] > o[2] ? true : false,
+        e9s[1],
+        e21s[1],
+        e21s[1] > e21s[2] ? true : false,
+        e55s[1],
+        e55s[1] > e55s[2] ? true : false,
+        e200s[1],
+        rsiS[1],
+        rsiS[2],
+        macdLine[1],
+        macdLine[2],
+        macdHist[1],
+        macdHist[2],
+        ta.barssince(emaCrUp)[1],
+        ta.barssince(emaCrDn)[1],
+        ta.barssince(macdCrUp)[1],
+        ta.barssince(macdCrDn)[1],
+        atrS[1],
+        volsS[1],
+        phS[1],
+        plS[1],
+        diPlusS[1],
+        diMinusS[1],
+        adxS[1],
+        atrPctS[1],
+        ta.sma(atrPctS, inVolSmaLen)[1],
+        ta.vwap(hlc3)[1],
+        time[1]
+    ]
+
+// ── Trend TF (bias) ─────────────────────────────────────────────────────────
+[c45, o45, h45, l45, v45, vUp45, pBear45, pBull45, eF45, eM45, eMr45, eS45, eSr45, eT45, rsi45, rsiP45, ml45, mlP45, mh45, mhP45, crUpA45, crDnA45, mcrUpA45, mcrDnA45, atr45, vAvg45, ph45, pl45, diP45, diM45, adx45, ap45, apAvg45, vw45, t45] = request.security(syminfo.tickerid, inHtf, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ── Momentum TF (confirmation + regime) ─────────────────────────────────────
+[c15, o15, h15, l15, v15, vUp15, pBear15, pBull15, eF15, eM15, eMr15, eS15, eSr15, eT15, rsi15, rsiP15, ml15, mlP15, mh15, mhP15, crUpA15, crDnA15, mcrUpA15, mcrDnA15, atr15, vAvg15, ph15, pl15, diP15, diM15, adx15, ap15, apAvg15, vw15, t15] = request.security(syminfo.tickerid, inMid, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ── Entry TF (execution) ────────────────────────────────────────────────────
+[cE, oE, hE, lE, vE, vUpE, pBearE, pBullE, eFE, eME, eMrE, eSE, eSrE, eTE, rsiE, rsiPE, mlE, mlPE, mhE, mhPE, crUpAE, crDnAE, mcrUpAE, mcrDnAE, atrE, vAvgE, phE, plE, diPE, diME, adxE, apE, apAvgE, vwE, tE] = request.security(syminfo.tickerid, inEntry, f_pack(close, open, high, low, volume), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ENTRY-BAR EDGE LATCH
+// Fires once per confirmed entry-TF bar (on the first chart bar that sees the
+// new confirmed entry bar). All signal decisions are made at that moment,
+// using only confirmed data.
+// ════════════════════════════════════════════════════════════════════════════
+isNewEntryBar = not na(tE) and ta.change(tE) != 0
+
+// ── Pivot state machine (confirmed pivots, age counted in entry bars) ──────
+var float lastPhE = na
+var float lastPlE = na
+var int phAgeE = 0
+var int plAgeE = 0
+if isNewEntryBar
+    phAgeE += 1
+    plAgeE += 1
+freshPh = not na(phE) and (na(lastPhE) or phE != lastPhE)
+freshPl = not na(plE) and (na(lastPlE) or plE != lastPlE)
+if freshPh
+    lastPhE := phE
+    phAgeE := 0
+if freshPl
+    lastPlE := plE
+    plAgeE := 0
+phValidE = not na(lastPhE) and phAgeE <= inPivAgeMax
+plValidE = not na(lastPlE) and plAgeE <= inPivAgeMax
+phFreshE = not na(lastPhE) and phAgeE <= inPivFresh
+plFreshE = not na(lastPlE) and plAgeE <= inPivFresh
+
+// ════════════════════════════════════════════════════════════════════════════
+// MARKET REGIME (on the momentum TF)
+//  3 = ABNORMAL VOL · 1 = TRENDING UP · -1 = TRENDING DOWN · 0 = RANGING
+// ════════════════════════════════════════════════════════════════════════════
+volSpike = apAvg15 > 0 and ap15 / apAvg15 > inVolSpike
+sepPct = c15 > 0 ? (eM15 - eS15) / c15 * 100 : 0.0
+trendUpR = adx15 >= inAdxTrend and sepPct >= inSepMin and diP15 > diM15
+trendDnR = adx15 >= inAdxTrend and sepPct <= -inSepMin and diM15 > diP15
+regime = volSpike ? 3 : trendUpR ? 1 : trendDnR ? -1 : 0
+regimeLabel = regime == 3 ? "ABNORMAL VOL" : regime == 1 ? "TRENDING UP" : regime == -1 ? "TRENDING DOWN" : "RANGING"
+regimeChangeEv = regime != regime[1] and not na(regime[1])
+
+// ════════════════════════════════════════════════════════════════════════════
+// HTF TREND STATE + BIASES
+// ════════════════════════════════════════════════════════════════════════════
+trend45Up = eF45 > eM45 and eM45 > eS45
+trend45Dn = eF45 < eM45 and eM45 < eS45
+trend45 = trend45Up ? 1 : trend45Dn ? -1 : 0
+biasUp45 = trend45Up and c45 > eT45
+biasDn45 = trend45Dn and c45 < eT45
+bias45 = biasUp45 ? 1 : biasDn45 ? -1 : 0
+bias45Label = bias45 == 1 ? "BULLISH" : bias45 == -1 ? "BEARISH" : "NEUTRAL"
+bias45Color = bias45 == 1 ? color.new(color.green, 0) : bias45 == -1 ? color.new(color.red, 0) : color.new(color.gray, 20)
+biasUp15 = eF15 > eM15 and eM15 > eS15 and c15 > eT15
+biasDn15 = eF15 < eM15 and eM15 < eS15 and c15 < eT15
+bias15 = biasUp15 ? 1 : biasDn15 ? -1 : 0
+bias15Label = bias15 == 1 ? "BULLISH" : bias15 == -1 ? "BEARISH" : "NEUTRAL"
+bias15Color = bias15 == 1 ? color.new(color.green, 0) : bias15 == -1 ? color.new(color.red, 0) : color.new(color.gray, 20)
+biasUp5 = eFE > eME and eME > eSE and cE > eTE
+biasDn5 = eFE < eME and eME < eSE and cE < eTE
+bias5 = biasUp5 ? 1 : biasDn5 ? -1 : 0
+bias5Label = bias5 == 1 ? "BULLISH" : bias5 == -1 ? "BEARISH" : "NEUTRAL"
+bias5Color = bias5 == 1 ? color.new(color.green, 0) : bias5 == -1 ? color.new(color.red, 0) : color.new(color.gray, 20)
+trendChangeEv = bias45 != bias45[1] and not na(bias45[1])
+
+// ════════════════════════════════════════════════════════════════════════════
+// SCALP SCORING (100 points) — evaluated on the last confirmed entry bar
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── LONG ────────────────────────────────────────────────────────────────────
+// 45m trend (4 sub-points)
+sT45a = trend45Up ? 2.0 : (eF45 > eM45 ? 1.0 : 0.0)
+sT45b = c45 > eT45 ? 1.0 : 0.0
+sT45c = c45 > eS45 ? 1.0 : 0.0
+scoreT45L = wT45 * (sT45a + sT45b + sT45c) / 4
+// 15m momentum (5 sub-points)
+sM15a = mh15 > 0 ? 1.0 : 0.0
+sM15b = mh15 > mhP15 ? 1.0 : 0.0
+sM15c = rsi15 > inRsiMid ? 1.0 : 0.0
+sM15d = eF15 > eM15 ? 1.0 : 0.0
+sM15e = rsi15 > rsiP15 ? 1.0 : 0.0
+scoreM15L = wM15 * (sM15a + sM15b + sM15c + sM15d + sM15e) / 5
+// 5m EMA structure (4 sub-points)
+sE5a = eFE > eME ? 1.0 : 0.0
+sE5b = eME > eSE ? 1.0 : 0.0
+sE5c = cE > eFE ? 1.0 : 0.0
+sE5d = eSrE ? 1.0 : 0.0
+scoreE5L = wE5 * (sE5a + sE5b + sE5c + sE5d) / 4
+// RSI momentum (3 sub-points)
+sRsiL = (rsiE > inRsiMid ? 1.0 : 0.0) + (rsiE > rsiPE ? 1.0 : 0.0) + (rsiE < inRsiOb ? 1.0 : 0.0)
+scoreRsiL = wRsi * sRsiL / 3
+// MACD momentum (3 sub-points)
+sMcdL = (mhE > 0 ? 1.0 : 0.0) + (mlE > 0 ? 1.0 : 0.0) + (mhE > mhPE ? 1.0 : 0.0)
+scoreMcdL = wMcd * sMcdL / 3
+// Volume (4 sub-points)
+sVolL = (vE > inVolMult * vAvgE ? 2.0 : 0.0) + (cE > oE ? 1.0 : 0.0) + (vUpE ? 1.0 : 0.0)
+scoreVolL = wVol * sVolL / 4
+// Market structure (4 sub-points)
+sStrL = (phFreshE and cE > lastPhE ? 2.0 : 0.0) + (plValidE and lE <= lastPlE + 0.3 * atrE and cE > lastPlE + 0.1 * atrE ? 1.0 : 0.0) + (eMrE ? 1.0 : 0.0)
+scoreStrL = wStr * sStrL / 4
+scoreLongTotal = scoreT45L + scoreM15L + scoreE5L + scoreRsiL + scoreMcdL + scoreVolL + scoreStrL
+
+// ── SHORT (mirror) ──────────────────────────────────────────────────────────
+sT45aS = trend45Dn ? 2.0 : (eF45 < eM45 ? 1.0 : 0.0)
+sT45bS = c45 < eT45 ? 1.0 : 0.0
+sT45cS = c45 < eS45 ? 1.0 : 0.0
+scoreT45S = wT45 * (sT45aS + sT45bS + sT45cS) / 4
+sM15aS = mh15 < 0 ? 1.0 : 0.0
+sM15bS = mh15 < mhP15 ? 1.0 : 0.0
+sM15cS = rsi15 < inRsiMid ? 1.0 : 0.0
+sM15dS = eF15 < eM15 ? 1.0 : 0.0
+sM15eS = rsi15 < rsiP15 ? 1.0 : 0.0
+scoreM15S = wM15 * (sM15aS + sM15bS + sM15cS + sM15dS + sM15eS) / 5
+sE5aS = eFE < eME ? 1.0 : 0.0
+sE5bS = eME < eSE ? 1.0 : 0.0
+sE5cS = cE < eFE ? 1.0 : 0.0
+eSDnE = na(eSrE) ? false : not eSrE
+sE5dS = eSDnE ? 1.0 : 0.0
+scoreE5S = wE5 * (sE5aS + sE5bS + sE5cS + sE5dS) / 4
+sRsiS = (rsiE < inRsiMid ? 1.0 : 0.0) + (rsiE < rsiPE ? 1.0 : 0.0) + (rsiE > inRsiOs ? 1.0 : 0.0)
+scoreRsiS = wRsi * sRsiS / 3
+sMcdS = (mhE < 0 ? 1.0 : 0.0) + (mlE < 0 ? 1.0 : 0.0) + (mhE < mhPE ? 1.0 : 0.0)
+scoreMcdS = wMcd * sMcdS / 3
+sVolS = (vE > inVolMult * vAvgE ? 2.0 : 0.0) + (cE < oE ? 1.0 : 0.0) + (vUpE ? 1.0 : 0.0)
+scoreVolS = wVol * sVolS / 4
+eMrDnE = na(eMrE) ? false : not eMrE
+sStrS = (plFreshE and cE < lastPlE ? 2.0 : 0.0) + (phValidE and hE >= lastPhE - 0.3 * atrE and cE < lastPhE - 0.1 * atrE ? 1.0 : 0.0) + (eMrDnE ? 1.0 : 0.0)
+scoreStrS = wStr * sStrS / 4
+scoreShortTotal = scoreT45S + scoreM15S + scoreE5S + scoreRsiS + scoreMcdS + scoreVolS + scoreStrS
+
+// ════════════════════════════════════════════════════════════════════════════
+// REVERSAL SCORING (100 points) — countertrend, requires rejection evidence
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── LONG (fade a bearish move at support) ───────────────────────────────────
+sRej1 = plValidE and lE <= lastPlE + 0.25 * atrE ? 5.0 : 0.0
+sRej2 = cE > oE ? 5.0 : 0.0
+sRej3 = (cE - lE) >= math.max(0.3 * atrE, 0.4 * (hE - lE)) ? 5.0 : 0.0
+sRej4 = pBearE ? 5.0 : 0.0
+sRej5 = rsiE > inRsiOs and rsiE <= inRsiStrong ? 5.0 : 0.0
+scoreRejL = wRej * (sRej1 + sRej2 + sRej3 + sRej4 + sRej5) / 25
+sMtn1 = rsiE > rsiPE ? 5.0 : 0.0
+sMtn2 = mhE > mhPE ? 5.0 : 0.0
+sMtn3 = not na(mcrUpAE) and mcrUpAE <= inRecency ? 5.0 : 0.0
+sMtn4 = mhPE < 0 ? 5.0 : 0.0
+sMtn5 = rsiE > inRsiWeak ? 5.0 : 0.0
+scoreMtnL = wMtn * (sMtn1 + sMtn2 + sMtn3 + sMtn4 + sMtn5) / 25
+sHwf1 = mh15 < mhP15 ? 5.0 : 0.0
+sHwf2 = rsi15 < inRsiMid ? 5.0 : 0.0
+sHwf3 = diM15 > diP15 ? 5.0 : 0.0
+scoreHwfL = wHwf * (sHwf1 + sHwf2 + sHwf3) / 15
+sFlp1 = not na(crUpAE) and crUpAE <= inRecency ? 5.0 : 0.0
+sFlp2 = not na(mcrUpAE) and mcrUpAE <= inRecency ? 5.0 : 0.0
+scoreFlpL = wFlp * (sFlp1 + sFlp2) / 10
+sRvl1 = vE > inVolMult * vAvgE ? 5.0 : 0.0
+sRvl2 = vUpE ? 5.0 : 0.0
+sRvl3 = cE > oE and vE > vAvgE ? 5.0 : 0.0
+scoreRvlL = wRvl * (sRvl1 + sRvl2 + sRvl3) / 15
+sRst1 = plValidE and lE <= lastPlE + 0.5 * atrE and cE > lastPlE ? 5.0 : 0.0
+sRst2 = eMrE ? 5.0 : 0.0
+scoreRstL = wRst * (sRst1 + sRst2) / 10
+revScoreLongTotal = scoreRejL + scoreMtnL + scoreHwfL + scoreFlpL + scoreRvlL + scoreRstL
+
+// ── SHORT (fade a bullish move at resistance) ───────────────────────────────
+sRej1S = phValidE and hE >= lastPhE - 0.25 * atrE ? 5.0 : 0.0
+sRej2S = cE < oE ? 5.0 : 0.0
+sRej3S = (hE - cE) >= math.max(0.3 * atrE, 0.4 * (hE - lE)) ? 5.0 : 0.0
+sRej4S = pBullE ? 5.0 : 0.0
+sRej5S = rsiE < inRsiOb and rsiE >= inRsiWeak ? 5.0 : 0.0
+scoreRejS = wRej * (sRej1S + sRej2S + sRej3S + sRej4S + sRej5S) / 25
+sMtn1S = rsiE < rsiPE ? 5.0 : 0.0
+sMtn2S = mhE < mhPE ? 5.0 : 0.0
+sMtn3S = not na(mcrDnAE) and mcrDnAE <= inRecency ? 5.0 : 0.0
+sMtn4S = mhPE > 0 ? 5.0 : 0.0
+sMtn5S = rsiE < inRsiWeak ? 5.0 : 0.0
+scoreMtnS = wMtn * (sMtn1S + sMtn2S + sMtn3S + sMtn4S + sMtn5S) / 25
+sHwf1S = mh15 > mhP15 ? 5.0 : 0.0
+sHwf2S = rsi15 > inRsiMid ? 5.0 : 0.0
+sHwf3S = diP15 > diM15 ? 5.0 : 0.0
+scoreHwfS = wHwf * (sHwf1S + sHwf2S + sHwf3S) / 15
+sFlp1S = not na(crDnAE) and crDnAE <= inRecency ? 5.0 : 0.0
+sFlp2S = not na(mcrDnAE) and mcrDnAE <= inRecency ? 5.0 : 0.0
+scoreFlpS = wFlp * (sFlp1S + sFlp2S) / 10
+sRvl1S = vE > inVolMult * vAvgE ? 5.0 : 0.0
+sRvl2S = vUpE ? 5.0 : 0.0
+sRvl3S = cE < oE and vE > vAvgE ? 5.0 : 0.0
+scoreRvlS = wRvl * (sRvl1S + sRvl2S + sRvl3S) / 15
+sRst1S = phValidE and hE >= lastPhE - 0.5 * atrE and cE < lastPhE ? 5.0 : 0.0
+sRst2S = eMrDnE ? 5.0 : 0.0
+scoreRstS = wRst * (sRst1S + sRst2S) / 10
+revScoreShortTotal = scoreRejS + scoreMtnS + scoreHwfS + scoreFlpS + scoreRvlS + scoreRstS
+
+// ════════════════════════════════════════════════════════════════════════════
+// GATES
+// ════════════════════════════════════════════════════════════════════════════
+thrNow = isScalp ? inScalpThr : inRevThr
+BIG = 1e18
+roomLong = phValidE and lastPhE > cE ? lastPhE - cE : BIG
+roomShort = plValidE and lastPlE < cE ? cE - lastPlE : BIG
+regimeOk = not inBlockAbnormal or regime != 3
+vwapLongOk = not inVwapGate or cE > vwE
+vwapShortOk = not inVwapGate or cE < vwE
+roomLongOk = not inRequireRoom or roomLong >= inMinRoomAtr * atrE
+roomShortOk = not inRequireRoom or roomShort >= inMinRoomAtr * atrE
+trendLongOk = inStrictTrend ? trend45 == 1 : trend45 != -1
+trendShortOk = inStrictTrend ? trend45 == -1 : trend45 != 1
+revLongOk = trend45 != 1
+revShortOk = trend45 != -1
+
+// ── Actionable signals (latched once per confirmed entry bar) ───────────────
+longSig = isNewEntryBar and (
+    isScalp ? scoreLongTotal >= inScalpThr and trendLongOk and regimeOk and vwapLongOk and roomLongOk :
+    revScoreLongTotal >= inRevThr and revLongOk and regimeOk and vwapLongOk and roomLongOk)
+shortSig = isNewEntryBar and (
+    isScalp ? scoreShortTotal >= inScalpThr and trendShortOk and regimeOk and vwapShortOk and roomShortOk :
+    revScoreShortTotal >= inRevThr and revShortOk and regimeOk and vwapShortOk and roomShortOk)
+
+// ════════════════════════════════════════════════════════════════════════════
+// PAPER POSITION TRACKER (for EXIT alerts & table display — not execution)
+// Order per bar: STOP → TARGET → REVERSAL → TREND FLIP → new entry.
+// Conservative tie-break: stop is checked before target.
+// ════════════════════════════════════════════════════════════════════════════
+var int pos = 0
+var float entryPx = na
+var float stopPx = na
+var float tgtPx = na
+var float entryAtr = na
+var float entryTime = na
+var float entryScore = na
+var int barsHeld = 0
+var float lastExitPx = na
+var float lastExitTime = na
+var string lastExitReason = ""
+var float lastExitPnlPct = na
+var int lastExitSide = 0
+var int lastSigSide = 0
+var float lastSigScore = na
+var float lastSigTime = na
+
+int exitSideBar = 0
+string exitReasonBar = ""
+float exitPxBar = na
+
+if isNewEntryBar
+    if pos != 0
+        barsHeld += 1
+    // 1) manage open position with the just-confirmed entry bar
+    if pos == 1
+        if lE <= stopPx
+            exitPxBar := oE < stopPx ? oE : stopPx
+            exitReasonBar := "STOP"
+            pos := 0
+        else if hE >= tgtPx
+            exitPxBar := oE > tgtPx ? oE : tgtPx
+            exitReasonBar := "TARGET"
+            pos := 0
+        else if shortSig
+            exitReasonBar := "REVERSAL"
+            exitPxBar := cE
+            pos := 0
+        else if inTrendExit and isScalp and trend45 == -1
+            // SCALP only: a reversal long ENTERS on a bearish 45m trend, so a
+            // trend-flip exit would be self-contradictory in REVERSAL mode.
+            exitReasonBar := "TREND FLIP"
+            exitPxBar := cE
+            pos := 0
+        if exitReasonBar != ""
+            lastExitPx := exitPxBar
+            lastExitTime := tE
+            lastExitReason := exitReasonBar
+            lastExitSide := 1
+            exitSideBar := 1
+            lastExitPnlPct := entryPx > 0 ? (exitPxBar - entryPx) / entryPx * 100 : 0.0
+            barsHeld := 0
+    if pos == -1
+        if hE >= stopPx
+            exitPxBar := oE > stopPx ? oE : stopPx
+            exitReasonBar := "STOP"
+            pos := 0
+        else if lE <= tgtPx
+            exitPxBar := oE < tgtPx ? oE : tgtPx
+            exitReasonBar := "TARGET"
+            pos := 0
+        else if longSig
+            exitReasonBar := "REVERSAL"
+            exitPxBar := cE
+            pos := 0
+        else if inTrendExit and isScalp and trend45 == 1
+            // SCALP only (see note in the long block above)
+            exitReasonBar := "TREND FLIP"
+            exitPxBar := cE
+            pos := 0
+        if exitReasonBar != ""
+            lastExitPx := exitPxBar
+            lastExitTime := tE
+            lastExitReason := exitReasonBar
+            lastExitSide := -1
+            exitSideBar := -1
+            lastExitPnlPct := entryPx > 0 ? (entryPx - exitPxBar) / entryPx * 100 : 0.0
+            barsHeld := 0
+    // 2) open new positions
+    if pos == 0
+        if longSig
+            pos := 1
+            entryPx := cE
+            entryAtr := atrE
+            stopPx := cE - inStopAtr * atrE
+            tgtPx := cE + inTgtAtr * atrE
+            entryTime := tE
+            entryScore := isScalp ? scoreLongTotal : revScoreLongTotal
+            barsHeld := 0
+        else if shortSig
+            pos := -1
+            entryPx := cE
+            entryAtr := atrE
+            stopPx := cE + inStopAtr * atrE
+            tgtPx := cE - inTgtAtr * atrE
+            entryTime := tE
+            entryScore := isScalp ? scoreShortTotal : revScoreShortTotal
+            barsHeld := 0
+    // 3) remember last signal for display
+    if longSig
+        lastSigSide := 1
+        lastSigScore := isScalp ? scoreLongTotal : revScoreLongTotal
+        lastSigTime := tE
+    else if shortSig
+        lastSigSide := -1
+        lastSigScore := isScalp ? scoreShortTotal : revScoreShortTotal
+        lastSigTime := tE
+
+exitLongEv = isNewEntryBar and exitSideBar == 1
+exitShortEv = isNewEntryBar and exitSideBar == -1
+
+posLabel = pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT"
+posPnlPct = pos == 1 and not na(entryPx) ? (cE - entryPx) / entryPx * 100 : pos == -1 and not na(entryPx) ? (entryPx - cE) / entryPx * 100 : 0.0
+
+// ════════════════════════════════════════════════════════════════════════════
+// EXPLANATION TEXT (why the signal fired / why it was blocked)
+// ════════════════════════════════════════════════════════════════════════════
+f_gateState(ok, name) =>
+    name + (ok ? " PASS" : " FAIL")
+evalSide = bias45 == -1 and not isScalp ? -1 : bias45 >= 0 ? 1 : -1
+gateList = f_gateState(evalSide > 0 ? trendLongOk : trendShortOk, "HTF trend") + " · " + f_gateState(regimeOk, "regime(" + regimeLabel + ")") + " · " + f_gateState(evalSide > 0 ? vwapLongOk : vwapShortOk, "VWAP") + " · " + f_gateState(evalSide > 0 ? roomLongOk : roomShortOk, "room(" + str.tostring(evalSide > 0 ? roomLong / atrE : roomShort / atrE, "0.00") + " ATR)")
+f_sc(comp) =>
+    str.tostring(math.round(nz(comp)), "0")
+scalpBreakdownL = "45mT " + f_sc(scoreT45L) + "/" + str.tostring(wT45) + " · 15mM " + f_sc(scoreM15L) + "/" + str.tostring(wM15) + " · EMA5 " + f_sc(scoreE5L) + "/" + str.tostring(wE5) + " · RSI " + f_sc(scoreRsiL) + "/" + str.tostring(wRsi) + " · MACD " + f_sc(scoreMcdL) + "/" + str.tostring(wMcd) + " · VOL " + f_sc(scoreVolL) + "/" + str.tostring(wVol) + " · STR " + f_sc(scoreStrL) + "/" + str.tostring(wStr)
+scalpBreakdownS = "45mT " + f_sc(scoreT45S) + "/" + str.tostring(wT45) + " · 15mM " + f_sc(scoreM15S) + "/" + str.tostring(wM15) + " · EMA5 " + f_sc(scoreE5S) + "/" + str.tostring(wE5) + " · RSI " + f_sc(scoreRsiS) + "/" + str.tostring(wRsi) + " · MACD " + f_sc(scoreMcdS) + "/" + str.tostring(wMcd) + " · VOL " + f_sc(scoreVolS) + "/" + str.tostring(wVol) + " · STR " + f_sc(scoreStrS) + "/" + str.tostring(wStr)
+revBreakdownL = "REJ " + f_sc(scoreRejL) + "/" + str.tostring(wRej) + " · MTN " + f_sc(scoreMtnL) + "/" + str.tostring(wMtn) + " · HTF-W " + f_sc(scoreHwfL) + "/" + str.tostring(wHwf) + " · FLIP " + f_sc(scoreFlpL) + "/" + str.tostring(wFlp) + " · VOL " + f_sc(scoreRvlL) + "/" + str.tostring(wRvl) + " · STR " + f_sc(scoreRstL) + "/" + str.tostring(wRst)
+revBreakdownS = "REJ " + f_sc(scoreRejS) + "/" + str.tostring(wRej) + " · MTN " + f_sc(scoreMtnS) + "/" + str.tostring(wMtn) + " · HTF-W " + f_sc(scoreHwfS) + "/" + str.tostring(wHwf) + " · FLIP " + f_sc(scoreFlpS) + "/" + str.tostring(wFlp) + " · VOL " + f_sc(scoreRvlS) + "/" + str.tostring(wRvl) + " · STR " + f_sc(scoreRstS) + "/" + str.tostring(wRst)
+breakdownL = isScalp ? scalpBreakdownL : revBreakdownL
+breakdownS = isScalp ? scalpBreakdownS : revBreakdownS
+
+// ════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ════════════════════════════════════════════════════════════════════════════
+plot(inShowEmas ? ta.ema(close, inEmaFast) : na, "EMA Fast (chart)", color = color.new(color.aqua, 0), linewidth = 1)
+plot(inShowEmas ? ta.ema(close, inEmaMid) : na, "EMA Mid (chart)", color = color.new(color.orange, 0), linewidth = 1)
+plot(inShowEmas ? ta.ema(close, inEmaSlow) : na, "EMA Slow (chart)", color = color.new(color.purple, 0), linewidth = 1)
+plot(inShowEmas ? ta.ema(close, inEmaTrend) : na, "EMA Trend (chart)", color = color.new(color.yellow, 30), linewidth = 2)
+plot(inShowVwap ? ta.vwap(hlc3) : na, "Session VWAP (chart)", color = color.new(color.fuchsia, 40), linewidth = 1)
+
+// position levels
+plot(pos == 1 ? stopPx : na, "Stop (long)", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 1)
+plot(pos == 1 ? tgtPx : na, "Target (long)", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
+plot(pos == -1 ? stopPx : na, "Stop (short)", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 1)
+plot(pos == -1 ? tgtPx : na, "Target (short)", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
+plot(pos != 0 ? entryPx : na, "Paper entry", color = color.new(color.blue, 0), style = plot.style_linebr, linewidth = 1)
+
+// signals — value computed on bar N (confirmed data), drawn on signal bar N-1
+plotshape(longSig, title = "BUY signal", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 0), size = size.small, offset = -1)
+plotshape(shortSig, title = "SELL signal", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small, offset = -1)
+
+if inShowLabels and longSig
+    label.new(bar_index - 1, lE, "BUY " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + "/" + str.tostring(thrNow) + "\nE " + str.tostring(cE, format.mintick) + " S " + str.tostring(cE - inStopAtr * atrE, format.mintick) + " T " + str.tostring(cE + inTgtAtr * atrE, format.mintick), style = label.style_label_up, color = color.new(color.green, 70), textcolor = color.white, size = size.small)
+if inShowLabels and shortSig
+    label.new(bar_index - 1, hE, "SELL " + str.tostring(math.round(nz(isScalp ? scoreShortTotal : revScoreShortTotal)), "0") + "/" + str.tostring(thrNow) + "\nE " + str.tostring(cE, format.mintick) + " S " + str.tostring(cE + inStopAtr * atrE, format.mintick) + " T " + str.tostring(cE - inTgtAtr * atrE, format.mintick), style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ════════════════════════════════════════════════════════════════════════════
+var table tbl = na
+if inShowTable and barstate.islast
+    table.delete(tbl)
+    tbl := table.new(position.top_left, 5, 10, border_width = 1, border_color = color.new(color.silver, 70), frame_width = 1, frame_color = color.new(color.silver, 50))
+    hdrBg = color.new(color.purple, 25)
+    tbl.cell(0, 0, syminfo.ticker + " SIGNAL ENGINE", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(1, 0, inMode, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(2, 0, "TF " + inHtf + " / " + inMid + " / " + inEntry, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(3, 0, "chart " + timeframe.period, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(4, 0, "NON-REPAINT v1.0", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+
+    tbl.cell(0, 1, "BIAS", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 1, "45M " + bias45Label, text_color = bias45Color, text_size = size.small)
+    tbl.cell(2, 1, "15M " + bias15Label, text_color = bias15Color, text_size = size.small)
+    tbl.cell(3, 1, "5M " + bias5Label, text_color = bias5Color, text_size = size.small)
+    tbl.cell(4, 1, regimeLabel, text_color = regime == 3 ? color.new(color.orange, 0) : color.white, bgcolor = regime == 3 ? color.new(color.orange, 60) : na, text_size = size.small)
+
+    tbl.cell(0, 2, "REGIME", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 2, "ADX " + str.tostring(nz(adx15), "0"), text_size = size.small)
+    tbl.cell(2, 2, "ATR% " + str.tostring(nz(ap15), "0.00") + " / " + str.tostring(nz(apAvg15), "0.00"), text_size = size.small)
+    tbl.cell(3, 2, "VWAP " + (na(vwE) ? "—" : cE > vwE ? "ABOVE" : "BELOW"), text_size = size.small)
+    tbl.cell(4, 2, "ATR " + str.tostring(nz(atrE), format.mintick), text_size = size.small)
+
+    curSigText = longSig ? "▲ BUY" : shortSig ? "▼ SELL" : lastSigSide != 0 ? (lastSigSide > 0 ? "last ▲ BUY" : "last ▼ SELL") : "—"
+    curSigColor = longSig ? color.new(color.green, 0) : shortSig ? color.new(color.red, 0) : color.silver
+    sigScore = longSig or shortSig ? (longSig ? (isScalp ? scoreLongTotal : revScoreLongTotal) : (isScalp ? scoreShortTotal : revScoreShortTotal)) : nz(lastSigScore)
+    tbl.cell(0, 3, "SIGNAL", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 3, curSigText, text_color = curSigColor, text_size = size.small)
+    tbl.cell(2, 3, "SCORE", text_color = color.gray, text_size = size.small)
+    tbl.cell(3, 3, str.tostring(math.round(nz(sigScore)), "0") + "/" + str.tostring(thrNow), text_color = nz(sigScore) >= thrNow ? color.new(color.lime, 0) : color.silver, text_size = size.small)
+    tbl.cell(4, 3, na(lastSigTime) ? "last —" : "last " + str.format_time(lastSigTime, "yyyy-MM-dd HH:mm"), text_color = color.silver, text_size = size.small)
+
+    tbl.cell(0, 4, "PRICES", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 4, pos != 0 ? "E " + str.tostring(entryPx, format.mintick) : "E —", text_size = size.small)
+    tbl.cell(2, 4, pos != 0 ? "S " + str.tostring(stopPx, format.mintick) : "S —", text_color = color.new(color.red, 20), text_size = size.small)
+    tbl.cell(3, 4, pos != 0 ? "T " + str.tostring(tgtPx, format.mintick) : "T —", text_color = color.new(color.green, 20), text_size = size.small)
+    tbl.cell(4, 4, "R/R " + str.tostring(inTgtAtr / inStopAtr, "0.00") + ":1", text_size = size.small)
+
+    tbl.cell(0, 5, "POSITION", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 5, posLabel, text_color = pos == 1 ? color.new(color.green, 0) : pos == -1 ? color.new(color.red, 0) : color.silver, text_size = size.small)
+    tbl.cell(2, 5, posPnlPct != 0 ? (posPnlPct >= 0 ? "+" : "") + str.tostring(posPnlPct, "0.00") + "%" : "—", text_color = posPnlPct >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+    tbl.cell(3, 5, pos != 0 ? str.tostring(barsHeld) + " bars" : "—", text_color = color.silver, text_size = size.small)
+    tbl.cell(4, 5, "paper track", text_color = color.gray, text_size = size.small)
+
+    tbl.cell(0, 6, "LAST EXIT", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 6, lastExitReason == "" ? "—" : lastExitSide > 0 ? "LONG " + lastExitReason : "SHORT " + lastExitReason, text_color = color.silver, text_size = size.small)
+    tbl.cell(2, 6, na(lastExitPx) ? "—" : str.tostring(lastExitPx, format.mintick), text_color = color.silver, text_size = size.small)
+    tbl.cell(3, 6, na(lastExitPnlPct) ? "—" : (lastExitPnlPct >= 0 ? "+" : "") + str.tostring(lastExitPnlPct, "0.00") + "%", text_color = nz(lastExitPnlPct) >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+    tbl.cell(4, 6, na(lastExitTime) ? "—" : str.format_time(lastExitTime, "yyyy-MM-dd HH:mm"), text_color = color.silver, text_size = size.small)
+
+    tbl.cell(0, 7, "SCORE · LONG", text_color = color.new(color.green, 40), text_size = size.small)
+    table.merge_cells(tbl, 1, 7, 4, 7)
+    tbl.cell(1, 7, breakdownL + "  →  Σ " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0"), text_color = color.new(color.white, 20), text_size = size.small)
+    tbl.cell(0, 8, "SCORE · SHORT", text_color = color.new(color.red, 40), text_size = size.small)
+    table.merge_cells(tbl, 1, 8, 4, 8)
+    tbl.cell(1, 8, breakdownS + "  →  Σ " + str.tostring(math.round(nz(isScalp ? scoreShortTotal : revScoreShortTotal)), "0"), text_color = color.new(color.white, 20), text_size = size.small)
+    tbl.cell(0, 9, "GATES (" + (evalSide > 0 ? "LONG" : "SHORT") + ")", text_color = color.gray, text_size = size.small)
+    table.merge_cells(tbl, 1, 9, 4, 9)
+    tbl.cell(1, 9, gateList, text_color = color.new(color.white, 30), text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALERTS — signals & alerts only. NO order execution.
+// ════════════════════════════════════════════════════════════════════════════
+
+// classic alertcondition entries (visible in the alerts dropdown)
+alertcondition(longSig, "Signal Engine – BUY", "SIGNAL ENGINE: BUY on {{ticker}} ({{interval}})")
+alertcondition(shortSig, "Signal Engine – SELL", "SIGNAL ENGINE: SELL on {{ticker}} ({{interval}})")
+alertcondition(exitLongEv, "Signal Engine – EXIT LONG", "SIGNAL ENGINE: EXIT LONG on {{ticker}} ({{interval}})")
+alertcondition(exitShortEv, "Signal Engine – EXIT SHORT", "SIGNAL ENGINE: EXIT SHORT on {{ticker}} ({{interval}})")
+alertcondition(trendChangeEv, "Signal Engine – Trend change (HTF)", "SIGNAL ENGINE: 45m trend change on {{ticker}} ({{interval}})")
+alertcondition(regimeChangeEv, "SIGNAL Engine – Regime change", "SIGNAL ENGINE: regime change on {{ticker}} ({{interval}})")
+
+// webhook-compatible JSON
+f_compScalp(side) =>
+    "\"trend45\":" + str.tostring(math.round(nz(side > 0 ? scoreT45L : scoreT45S)), "0") + ',"mom15":' + str.tostring(math.round(nz(side > 0 ? scoreM15L : scoreM15S)), "0") + ',"ema5":' + str.tostring(math.round(nz(side > 0 ? scoreE5L : scoreE5S)), "0") + ',"rsi":' + str.tostring(math.round(nz(side > 0 ? scoreRsiL : scoreRsiS)), "0") + ',"macd":' + str.tostring(math.round(nz(side > 0 ? scoreMcdL : scoreMcdS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreVolL : scoreVolS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreStrL : scoreStrS)), "0")
+f_compRev(side) =>
+    "\"rejection\":" + str.tostring(math.round(nz(side > 0 ? scoreRejL : scoreRejS)), "0") + ',"momentum":' + str.tostring(math.round(nz(side > 0 ? scoreMtnL : scoreMtnS)), "0") + ',"htf_weakening":' + str.tostring(math.round(nz(side > 0 ? scoreHwfL : scoreHwfS)), "0") + ',"flip":' + str.tostring(math.round(nz(side > 0 ? scoreFlpL : scoreFlpS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreRvlL : scoreRvlS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreRstL : scoreRstS)), "0")
+f_comp(side) =>
+    isScalp ? f_compScalp(side) : f_compRev(side)
+f_json(event, side, px, scoreVal, compJson, reason) =>
+    '{"source":"signal-engine","version":"1.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(nz(tE), "0") + ',"time":"' + str.format_time(nz(tE), "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (pos != 0 and not na(entryPx) ? str.tostring(entryPx, format.mintick) : "null") + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
+
+if inAlerts and inJsonAlerts and longSig
+    alert(f_json("BUY", "LONG", cE, isScalp ? scoreLongTotal : revScoreLongTotal, f_comp(1), "score " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and longSig
+    alert("SIGNAL ENGINE BUY " + syminfo.ticker + " @ " + str.tostring(cE, format.mintick) + " stop " + str.tostring(cE - inStopAtr * atrE, format.mintick) + " target " + str.tostring(cE + inTgtAtr * atrE, format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and shortSig
+    alert(f_json("SELL", "SHORT", cE, isScalp ? scoreShortTotal : revScoreShortTotal, f_comp(-1), "score " + str.tostring(math.round(nz(isScalp ? scoreShortTotal : revScoreShortTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and shortSig
+    alert("SIGNAL ENGINE SELL " + syminfo.ticker + " @ " + str.tostring(cE, format.mintick) + " stop " + str.tostring(cE + inStopAtr * atrE, format.mintick) + " target " + str.tostring(cE - inTgtAtr * atrE, format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and exitLongEv
+    alert(f_json("EXIT_LONG", "LONG", lastExitPx, na, "", lastExitReason + " @ " + str.tostring(nz(lastExitPx), format.mintick) + " pnl " + str.tostring(nz(lastExitPnlPct), "0.00") + "%"), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and exitLongEv
+    alert("SIGNAL ENGINE EXIT LONG " + syminfo.ticker + " " + lastExitReason + " @ " + str.tostring(nz(lastExitPx), format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and exitShortEv
+    alert(f_json("EXIT_SHORT", "SHORT", lastExitPx, na, "", lastExitReason + " @ " + str.tostring(nz(lastExitPx), format.mintick) + " pnl " + str.tostring(nz(lastExitPnlPct), "0.00") + "%"), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and exitShortEv
+    alert("SIGNAL ENGINE EXIT SHORT " + syminfo.ticker + " " + lastExitReason + " @ " + str.tostring(nz(lastExitPx), format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and trendChangeEv
+    alert(f_json("TREND_CHANGE", bias45 > 0 ? "LONG" : bias45 < 0 ? "SHORT" : "FLAT", na, na, "", "HTF bias -> " + bias45Label), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and trendChangeEv
+    alert("SIGNAL ENGINE TREND CHANGE " + syminfo.ticker + " -> " + bias45Label, alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and regimeChangeEv
+    alert(f_json("REGIME_CHANGE", "FLAT", na, na, "", regimeLabel), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and regimeChangeEv
+    alert("SIGNAL ENGINE REGIME CHANGE " + syminfo.ticker + " -> " + regimeLabel, alert.freq_once_per_bar)
