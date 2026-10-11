@@ -137,25 +137,45 @@ python -m backtester.sample_data --out data/sample_near_5m_synth.csv --days 100
 python -m backtester --csv data/sample_near_5m_synth.csv --mode scalp
 
 # your real export (TradingView or KuCoin format — see data/README.md)
-python -m backtester --csv data/near_5m.csv --mode scalp --fee-pct 0.1 --slippage-pct 0.02
+python -m backtester --csv data/near_5m.csv --mode scalp   # slippage auto = 2 minticks from the CSV's price precision
 python -m backtester --csv data/near_5m.csv --mode reversal --out-trades data/trades.csv
 python tests/smoke_test.py   # non-repainting truncation test + engine invariants
 ```
 
 CLI mirrors the Pine settings: `--mode`, `--threshold`, `--stop-atr`,
-`--target-atr`, `--min-room-atr`, `--fee-pct`, `--slippage-pct`, `--qty-pct`,
-`--no-strict-trend`, `--vwap-gate`, `--no-block-abnormal`, … (run
-`python -m backtester --help`).
+`--target-atr`, `--min-room-atr`, `--fee-pct`, `--slippage-ticks`, `--tick`,
+`--slippage-pct`, `--qty-pct`, `--no-strict-trend`, `--vwap-gate`,
+`--no-block-abnormal`, `--out-trades`, `--out-signals`, `--check-norepaint`, …
+(run `python -m backtester --help`).
 
-**Equivalence with the Pine strategy:** entry at signal-bar close ± slippage,
-stop-before-target tie-break, same fee model, same 10%-of-equity sizing.
-Known minor deltas are listed in `docs/SIGNAL_SPEC.md` §11.
+**Equivalence with the Pine strategy:** entry at signal-bar close, slippage
+on **all fills** (entries and exits, adverse direction) at the *same tick
+count* (default 2 minticks — resolved per symbol from the export, matching
+the strategy's `Slippage (ticks)` input), stop-before-target tie-break, gap
+fills at the open, same fee model, same 10%-of-equity sizing. Known minor
+deltas are listed in `docs/SIGNAL_SPEC.md` §11.
 
 ### Running the non-repainting check
 
 `tests/smoke_test.py` includes a **truncation test**: signals computed on
 `data[:k]` must be bit-identical (scores, signals, regime) to the full run on
 those bars. This is the programmatic equivalent of "no disappearing arrows".
+
+### Validation tooling (analysis only — no model changes)
+
+```bash
+# data quality gate (run first on any real export)
+python -m backtester.check_data --csv data/near_5m_real.csv --window 2026-10-08,2026-10-10
+# loss taxonomy: WHY did losing trades happen (MFE/MAE, cost sensitivity)
+python -m backtester.diagnose --csv data/near_5m_real.csv --mode scalp
+# out-of-sample: optimise on train, validate once on test
+python -m backtester.oos --csv data/near_5m_real.csv --mode scalp --train-end 2026-08-31
+# TradingView strategy export vs Python trades
+python -m backtester.compare --py-trades py_trades.csv --tv-trades tv_trades.csv
+```
+
+The current development cycle (real data, loss diagnosis, OOS, TradingView
+verification, acceptance gates) is specified in **`docs/NEXT_STEPS.md`**.
 
 ---
 
@@ -184,3 +204,44 @@ automation can route accordingly.
 5. Only after validation: extend the JSON alerts toward KuCoin automation
    (the payload already carries entry/stop/target, score, regime and position
    state — nothing order-related, by design, in this release).
+
+---
+
+## Changelog
+
+### v2.1.1
+
+- Slippage now matches the Pine strategy exactly: the TV strategy applies
+  `Slippage (ticks)` in **minticks** (2 ticks = 0.038%/fill on Binance's
+  0.001-tick NEARUSDT vs 0.004% on KuCoin's 0.0001 tick). `estimate_mintick()`
+  auto-detects the tick from the export's price precision; CLI/OOS/diagnose
+  gain `--slippage-ticks` (default 2) and `--tick`; explicit `--slippage-pct`
+  still overrides (legacy). Report headers print the resolved cost basis.
+- Data spec aligned with the real chart: **NEAR/USDT (Binance spot) 5m**,
+  range 2026-06-15 → 2026-10-11 UTC (Oct 8–9 crash + recovery included).
+
+### v2.1.0
+
+Real-data validation cycle tooling (no model changes): `check_data` (data
+quality gate), `diagnose` (loss taxonomy + cost sensitivity), `oos`
+(single-pass out-of-sample protocol with acceptance gates G1–G4), `compare`
+(TradingView vs Python trade alignment). Plan in `docs/NEXT_STEPS.md`.
+
+### v2.0.0
+
+- **Fix: Python gates were silently disabled** — `~` (bitwise NOT) on Python
+  bools (`~True == -2`, truthy) made the regime/VWAP/room filters no-ops;
+  Pine was unaffected. Fixed with logical `not` + dedicated invariant tests.
+- Fix: slippage on **exit** fills (all implementations); fix: stale
+  stop/target display + exit reasons in the Pine strategy (levels cleared
+  when flat; reason inferred from bar OHLC vs pending levels).
+- Pine data layer split into role packs (45m: 5 / 15m: 14 / 5m: 29 fields);
+  report: per-direction stats, avg bars held, open-position note;
+  CLI: `--out-signals`, `--check-norepaint`; 26-check test suite;
+  alert JSON schema 2.0.0.
+
+### v1.0.0
+
+Initial release: multi-timeframe weighted-scoring indicator (SCALP +
+REVERSAL), equivalent strategy with regime attribution, Python backtester,
+webhook-ready JSON alerts, synthetic sample + smoke tests.
