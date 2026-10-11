@@ -1,0 +1,657 @@
+// This source file is subject to the terms of the Mozilla Public License 2.0
+// https://www.mozilla.org/MPL/2.0/
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  NEAR SIGNAL ENGINE — STRATEGY v1.0 (performance measurement)
+//  Pine Script v6 · TradingView
+//
+//  Purpose: measure the SAME signal logic used by pine/signal_engine.pine
+//  after fees and slippage — win rate, profit factor, max drawdown,
+//  average reward/risk, and results BY MARKET REGIME.
+//
+//  EQUIVALENCE RULES (vs the indicator + Python backtester):
+//    • Chart this strategy on the ENTRY timeframe (default 5m). The table
+//      warns if chart TF != entry TF.
+//    • Signals are evaluated on the confirmed bar (final OHLC) and orders
+//      are processed at that bar's CLOSE (process_orders_on_close=true),
+//      i.e. entry price = signal-bar close — identical to the Python
+//      backtester's entry convention.
+//    • HTF/MID values use the last CONFIRMED bar (lookahead_off + [1]) —
+//      non-repainting, no lookahead.
+//    • Stop/target: stop is checked before target on the same bar
+//      (conservative tie-break, same as the Python engine).
+//    • Reversal = opposite entry (auto-closes the position). Trend flip =
+//      strategy.close(). See docs/SIGNAL_SPEC.md.
+//
+//  SYNC — scoring/gate logic must stay identical to
+//    pine/signal_engine.pine and backtester/ (docs/SIGNAL_SPEC.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+
+inMode = input.string("SCALP", "Signal Mode", options = ["SCALP", "REVERSAL"], group = "Mode", tooltip = "SCALP = trend-following breakout. REVERSAL = countertrend rejection at support/resistance.")
+isScalp = inMode == "SCALP"
+
+inHtf = input.timeframe("45", "Trend TF (bias)", group = "Timeframes", tooltip = "Direction / trend bias timeframe.")
+inMid = input.timeframe("15", "Momentum TF (confirmation)", group = "Timeframes", tooltip = "Momentum confirmation + regime detection timeframe.")
+inEntry = input.timeframe("5", "Entry TF (execution)", group = "Timeframes", tooltip = "CHART THIS STRATEGY ON THIS TIMEFRAME.")
+
+inEmaFast = input.int(9, "EMA Fast", minval = 2, group = "Indicators")
+inEmaMid = input.int(21, "EMA Mid", minval = 2, group = "Indicators")
+inEmaSlow = input.int(55, "EMA Slow", minval = 2, group = "Indicators")
+inEmaTrend = input.int(200, "EMA Trend", minval = 2, group = "Indicators")
+inRsiLen = input.int(14, "RSI Length", minval = 2, group = "Indicators")
+inRsiWeak = input.int(40, "RSI Weak Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiMid = input.int(50, "RSI Neutral Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiStrong = input.int(60, "RSI Strong Level", minval = 1, maxval = 99, group = "Indicators")
+inRsiOb = input.int(70, "RSI Overbought", minval = 51, maxval = 99, group = "Indicators")
+inRsiOs = input.int(30, "RSI Oversold", minval = 1, maxval = 49, group = "Indicators")
+inMacdFast = input.int(12, "MACD Fast", minval = 2, group = "Indicators")
+inMacdSlow = input.int(26, "MACD Slow", minval = 2, group = "Indicators")
+inMacdSig = input.int(9, "MACD Signal", minval = 2, group = "Indicators")
+inVolLen = input.int(20, "Volume Average Length", minval = 2, group = "Indicators")
+inVolMult = input.float(1.5, "Volume Breakout ×", minval = 0.1, step = 0.1, group = "Indicators")
+inAtrLen = input.int(14, "ATR Length", minval = 2, group = "Indicators")
+inPivLen = input.int(5, "Pivot Left/Right Bars", minval = 2, maxval = 20, group = "Indicators")
+inRecency = input.int(3, "Cross Recency (bars)", minval = 1, maxval = 20, group = "Indicators")
+
+wT45 = input.int(20, "W: Trend (HTF)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wM15 = input.int(20, "W: Momentum (MID)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wE5 = input.int(15, "W: EMA structure (ENTRY)", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wRsi = input.int(10, "W: RSI", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wMcd = input.int(10, "W: MACD", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wVol = input.int(15, "W: Volume", minval = 0, maxval = 100, group = "Scoring · SCALP")
+wStr = input.int(10, "W: Market structure", minval = 0, maxval = 100, group = "Scoring · SCALP")
+inScalpThr = input.int(80, "SCALP minimum score", minval = 1, maxval = 100, group = "Scoring · SCALP")
+
+wRej = input.int(25, "W: Rejection at S/R", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wMtn = input.int(25, "W: Momentum turning", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wHwf = input.int(15, "W: HTF momentum weakening", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wFlp = input.int(10, "W: Entry-TF flip", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wRvl = input.int(15, "W: Volume", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+wRst = input.int(10, "W: Structure", minval = 0, maxval = 100, group = "Scoring · REVERSAL")
+inRevThr = input.int(70, "REVERSAL minimum score", minval = 1, maxval = 100, group = "Scoring · REVERSAL")
+
+inStopAtr = input.float(1.2, "Stop distance × ATR", minval = 0.1, step = 0.1, group = "Risk & Filters")
+inTgtAtr = input.float(1.8, "Target distance × ATR", minval = 0.1, step = 0.1, group = "Risk & Filters")
+inMinRoomAtr = input.float(2.0, "Min room to S/R × ATR", minval = 0.0, step = 0.1, group = "Risk & Filters")
+inPivAgeMax = input.int(120, "Pivot max age (entry bars)", minval = 5, group = "Risk & Filters")
+inPivFresh = input.int(15, "Pivot freshness for breakout (entry bars)", minval = 1, group = "Risk & Filters")
+inRequireRoom = input.bool(true, "Require R/R room filter", group = "Risk & Filters")
+inTrendExit = input.bool(true, "Exit on HTF trend flip", group = "Risk & Filters")
+
+inAdxLen = input.int(14, "ADX Length", minval = 2, group = "Regime (MID TF)")
+inAdxTrend = input.float(20, "ADX trending threshold", minval = 1, group = "Regime (MID TF)")
+inVolSpike = input.float(1.8, "Abnormal vol × (ATR% vs avg)", minval = 1.0, step = 0.1, group = "Regime (MID TF)")
+inVolSmaLen = input.int(100, "ATR% average length", minval = 10, group = "Regime (MID TF)")
+inSepMin = input.float(0.15, "Min EMA mid/slow separation %", minval = 0.01, step = 0.05, group = "Regime (MID TF)")
+inBlockAbnormal = input.bool(true, "Block entries in ABNORMAL VOL regime", group = "Regime (MID TF)")
+
+inStrictTrend = input.bool(true, "SCALP: require full HTF EMA alignment", group = "Gates")
+inVwapGate = input.bool(false, "Require session VWAP alignment", group = "Gates")
+
+inShowTable = input.bool(true, "Show stats table", group = "Display")
+
+inAlerts = input.bool(true, "Enable alert() events", group = "Alerts")
+inJsonAlerts = input.bool(true, "Webhook JSON payload", group = "Alerts")
+
+// ── Strategy mechanics ──────────────────────────────────────────────────────
+inCap = input.float(10000, "Initial Capital (USDT)", minval = 100, step = 100, group = "Strategy Mechanics")
+inQtyPct = input.float(10, "Position size % of equity", minval = 1, maxval = 100, group = "Strategy Mechanics")
+inFeePct = input.float(0.1, "Commission % per side (KuCoin taker)", minval = 0, step = 0.01, group = "Strategy Mechanics")
+inSlipTicks = input.int(2, "Slippage (ticks)", minval = 0, group = "Strategy Mechanics", tooltip = "1 tick = symbol mintick. 2 ticks on a 0.0001-tick quote ≈ 0.0002.")
+
+strategy("NEAR SIGNAL ENGINE [STRATEGY]", "SIGNAL ENGINE STRAT v1.0", overlay = true,
+     initial_capital = inCap,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = inQtyPct,
+     commission_type = strategy.commission.percent,
+     commission_value = inFeePct,
+     slippage = inSlipTicks,
+     pyramiding = 0,
+     process_orders_on_close = true)
+
+tfWarn = timeframe.period != inEntry
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONFIRMED HTF/MID DATA (same f_pack contract as the indicator)
+// ════════════════════════════════════════════════════════════════════════════
+f_pack_trend(src) =>
+    [
+        src[1],
+        ta.ema(src, inEmaFast)[1],
+        ta.ema(src, inEmaMid)[1],
+        ta.ema(src, inEmaSlow)[1],
+        ta.ema(src, inEmaTrend)[1]
+    ]
+
+f_pack_mom(src, h, l) =>
+    e9s = ta.ema(src, inEmaFast)
+    e21s = ta.ema(src, inEmaMid)
+    e55s = ta.ema(src, inEmaSlow)
+    e200s = ta.ema(src, inEmaTrend)
+    rsiS = ta.rsi(src, inRsiLen)
+    macdLine = ta.ema(src, inMacdFast) - ta.ema(src, inMacdSlow)
+    macdSig = ta.ema(macdLine, inMacdSig)
+    macdHist = macdLine - macdSig
+    atrS = ta.atr(inAtrLen)
+    atrPctS = src > 0 ? atrS / src * 100 : 0.0
+    upMove = h - h[1]
+    dnMove = l[1] - l
+    plusDM = upMove > dnMove and upMove > 0 ? upMove : 0.0
+    minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0.0
+    trS = ta.tr(h, l, src[1])
+    trRma = ta.rma(trS, inAdxLen)
+    diPlusS = trRma > 0 ? 100 * ta.rma(plusDM, inAdxLen) / trRma : 0.0
+    diMinusS = trRma > 0 ? 100 * ta.rma(minusDM, inAdxLen) / trRma : 0.0
+    diSum = diPlusS + diMinusS
+    dxS = diSum > 0 ? 100 * math.abs(diPlusS - diMinusS) / diSum : 0.0
+    adxS = ta.rma(dxS, inAdxLen)
+    [
+        src[1],
+        e9s[1],
+        e21s[1],
+        e55s[1],
+        e200s[1],
+        rsiS[1],
+        rsiS[2],
+        macdHist[1],
+        macdHist[2],
+        diPlusS[1],
+        diMinusS[1],
+        adxS[1],
+        atrPctS[1],
+        ta.sma(atrPctS, inVolSmaLen)[1]
+    ]
+
+// ── Trend TF (bias) — 5 confirmed fields ───────────────────────────────────
+[c45, eF45, eM45, eS45, eT45] = request.security(syminfo.tickerid, inHtf, f_pack_trend(close), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ── Momentum TF (confirmation + regime) — 14 confirmed fields ───────────────
+[c15, eF15, eM15, eS15, eT15, rsi15, rsiP15, mh15, mhP15, diP15, diM15, adx15, ap15, apAvg15] = request.security(syminfo.tickerid, inMid, f_pack_mom(close, high, low), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ENTRY-TF SERIES (chart must be the entry TF — direct, confirmed in backtest)
+// ════════════════════════════════════════════════════════════════════════════
+eF = ta.ema(close, inEmaFast)
+eM = ta.ema(close, inEmaMid)
+eS = ta.ema(close, inEmaSlow)
+eT = ta.ema(close, inEmaTrend)
+eMrE = eM > eM[1]
+eSrE = eS > eS[1]
+rsiE = ta.rsi(close, inRsiLen)
+rsiPE = rsiE[1]
+macdLineE = ta.ema(close, inMacdFast) - ta.ema(close, inMacdSlow)
+macdSigE = ta.ema(macdLineE, inMacdSig)
+macdHistE = macdLineE - macdSigE
+mhPE = macdHistE[1]
+mlE = macdLineE
+atrE = ta.atr(inAtrLen)
+vAvgE = ta.sma(volume, inVolLen)
+vUpE = volume > volume[1]
+pBearE = close[1] < open[1]
+pBullE = close[1] > open[1]
+crUpAE = ta.barssince(ta.crossover(eF, eM))
+crDnAE = ta.barssince(ta.crossunder(eF, eM))
+mcrUpAE = ta.barssince(ta.crossover(macdLineE, macdSigE))
+mcrDnAE = ta.barssince(ta.crossunder(macdLineE, macdSigE))
+phE = ta.pivothigh(high, inPivLen, inPivLen)
+plE = ta.pivotlow(low, inPivLen, inPivLen)
+vwE = ta.vwap(hlc3)
+
+// ── Pivot state machine (per entry bar) ─────────────────────────────────────
+var float lastPhE = na
+var float lastPlE = na
+var int phAgeE = 0
+var int plAgeE = 0
+phAgeE += 1
+plAgeE += 1
+freshPh = not na(phE) and (na(lastPhE) or phE != lastPhE)
+freshPl = not na(plE) and (na(lastPlE) or plE != lastPlE)
+if freshPh
+    lastPhE := phE
+    phAgeE := 0
+if freshPl
+    lastPlE := plE
+    plAgeE := 0
+phValidE = not na(lastPhE) and phAgeE <= inPivAgeMax
+plValidE = not na(lastPlE) and plAgeE <= inPivAgeMax
+phFreshE = not na(lastPhE) and phAgeE <= inPivFresh
+plFreshE = not na(lastPlE) and plAgeE <= inPivFresh
+
+// ════════════════════════════════════════════════════════════════════════════
+// MARKET REGIME (MID TF) — 3 ABNORMAL VOL · 1 TREND UP · -1 TREND DOWN · 0 RANGING
+// ════════════════════════════════════════════════════════════════════════════
+volSpike = apAvg15 > 0 and ap15 / apAvg15 > inVolSpike
+sepPct = c15 > 0 ? (eM15 - eS15) / c15 * 100 : 0.0
+trendUpR = adx15 >= inAdxTrend and sepPct >= inSepMin and diP15 > diM15
+trendDnR = adx15 >= inAdxTrend and sepPct <= -inSepMin and diM15 > diP15
+regime = volSpike ? 3 : trendUpR ? 1 : trendDnR ? -1 : 0
+regimeLabel = regime == 3 ? "ABNORMAL VOL" : regime == 1 ? "TRENDING UP" : regime == -1 ? "TRENDING DOWN" : "RANGING"
+regimeChangeEv = regime != regime[1] and not na(regime[1])
+
+// ── HTF trend + biases ──────────────────────────────────────────────────────
+trend45Up = eF45 > eM45 and eM45 > eS45
+trend45Dn = eF45 < eM45 and eM45 < eS45
+trend45 = trend45Up ? 1 : trend45Dn ? -1 : 0
+biasUp45 = trend45Up and c45 > eT45
+biasDn45 = trend45Dn and c45 < eT45
+bias45 = biasUp45 ? 1 : biasDn45 ? -1 : 0
+bias45Label = bias45 == 1 ? "BULLISH" : bias45 == -1 ? "BEARISH" : "NEUTRAL"
+trendChangeEv = bias45 != bias45[1] and not na(bias45[1])
+
+// ════════════════════════════════════════════════════════════════════════════
+// SCALP SCORING — identical sub-conditions to the indicator
+// ════════════════════════════════════════════════════════════════════════════
+sT45a = trend45Up ? 2.0 : (eF45 > eM45 ? 1.0 : 0.0)
+sT45b = c45 > eT45 ? 1.0 : 0.0
+sT45c = c45 > eS45 ? 1.0 : 0.0
+scoreT45L = wT45 * (sT45a + sT45b + sT45c) / 4
+sM15a = mh15 > 0 ? 1.0 : 0.0
+sM15b = mh15 > mhP15 ? 1.0 : 0.0
+sM15c = rsi15 > inRsiMid ? 1.0 : 0.0
+sM15d = eF15 > eM15 ? 1.0 : 0.0
+sM15e = rsi15 > rsiP15 ? 1.0 : 0.0
+scoreM15L = wM15 * (sM15a + sM15b + sM15c + sM15d + sM15e) / 5
+sE5a = eF > eM ? 1.0 : 0.0
+sE5b = eM > eS ? 1.0 : 0.0
+sE5c = close > eF ? 1.0 : 0.0
+sE5d = eSrE ? 1.0 : 0.0
+scoreE5L = wE5 * (sE5a + sE5b + sE5c + sE5d) / 4
+sRsiL = (rsiE > inRsiMid ? 1.0 : 0.0) + (rsiE > rsiPE ? 1.0 : 0.0) + (rsiE < inRsiOb ? 1.0 : 0.0)
+scoreRsiL = wRsi * sRsiL / 3
+sMcdL = (macdHistE > 0 ? 1.0 : 0.0) + (mlE > 0 ? 1.0 : 0.0) + (macdHistE > mhPE ? 1.0 : 0.0)
+scoreMcdL = wMcd * sMcdL / 3
+sVolL = (volume > inVolMult * vAvgE ? 2.0 : 0.0) + (close > open ? 1.0 : 0.0) + (vUpE ? 1.0 : 0.0)
+scoreVolL = wVol * sVolL / 4
+sStrL = (phFreshE and close > lastPhE ? 2.0 : 0.0) + (plValidE and low <= lastPlE + 0.3 * atrE and close > lastPlE + 0.1 * atrE ? 1.0 : 0.0) + (eMrE ? 1.0 : 0.0)
+scoreStrL = wStr * sStrL / 4
+scoreLongTotal = scoreT45L + scoreM15L + scoreE5L + scoreRsiL + scoreMcdL + scoreVolL + scoreStrL
+
+sT45aS = trend45Dn ? 2.0 : (eF45 < eM45 ? 1.0 : 0.0)
+sT45bS = c45 < eT45 ? 1.0 : 0.0
+sT45cS = c45 < eS45 ? 1.0 : 0.0
+scoreT45S = wT45 * (sT45aS + sT45bS + sT45cS) / 4
+sM15aS = mh15 < 0 ? 1.0 : 0.0
+sM15bS = mh15 < mhP15 ? 1.0 : 0.0
+sM15cS = rsi15 < inRsiMid ? 1.0 : 0.0
+sM15dS = eF15 < eM15 ? 1.0 : 0.0
+sM15eS = rsi15 < rsiP15 ? 1.0 : 0.0
+scoreM15S = wM15 * (sM15aS + sM15bS + sM15cS + sM15dS + sM15eS) / 5
+sE5aS = eF < eM ? 1.0 : 0.0
+sE5bS = eM < eS ? 1.0 : 0.0
+sE5cS = close < eF ? 1.0 : 0.0
+eMrDnE = na(eMrE) ? false : not eMrE
+sE5dS = eMrDnE ? 1.0 : 0.0
+scoreE5S = wE5 * (sE5aS + sE5bS + sE5cS + sE5dS) / 4
+sRsiS = (rsiE < inRsiMid ? 1.0 : 0.0) + (rsiE < rsiPE ? 1.0 : 0.0) + (rsiE > inRsiOs ? 1.0 : 0.0)
+scoreRsiS = wRsi * sRsiS / 3
+sMcdS = (macdHistE < 0 ? 1.0 : 0.0) + (mlE < 0 ? 1.0 : 0.0) + (macdHistE < mhPE ? 1.0 : 0.0)
+scoreMcdS = wMcd * sMcdS / 3
+sVolS = (volume > inVolMult * vAvgE ? 2.0 : 0.0) + (close < open ? 1.0 : 0.0) + (vUpE ? 1.0 : 0.0)
+scoreVolS = wVol * sVolS / 4
+sStrS = (plFreshE and close < lastPlE ? 2.0 : 0.0) + (phValidE and high >= lastPhE - 0.3 * atrE and close < lastPhE - 0.1 * atrE ? 1.0 : 0.0) + (eMrDnE ? 1.0 : 0.0)
+scoreStrS = wStr * sStrS / 4
+scoreShortTotal = scoreT45S + scoreM15S + scoreE5S + scoreRsiS + scoreMcdS + scoreVolS + scoreStrS
+
+// ════════════════════════════════════════════════════════════════════════════
+// REVERSAL SCORING — identical sub-conditions to the indicator
+// ════════════════════════════════════════════════════════════════════════════
+sRej1 = plValidE and low <= lastPlE + 0.25 * atrE ? 5.0 : 0.0
+sRej2 = close > open ? 5.0 : 0.0
+sRej3 = (close - low) >= math.max(0.3 * atrE, 0.4 * (high - low)) ? 5.0 : 0.0
+sRej4 = pBearE ? 5.0 : 0.0
+sRej5 = rsiE > inRsiOs and rsiE <= inRsiStrong ? 5.0 : 0.0
+scoreRejL = wRej * (sRej1 + sRej2 + sRej3 + sRej4 + sRej5) / 25
+sMtn1 = rsiE > rsiPE ? 5.0 : 0.0
+sMtn2 = macdHistE > mhPE ? 5.0 : 0.0
+sMtn3 = not na(mcrUpAE) and mcrUpAE <= inRecency ? 5.0 : 0.0
+sMtn4 = mhPE < 0 ? 5.0 : 0.0
+sMtn5 = rsiE > inRsiWeak ? 5.0 : 0.0
+scoreMtnL = wMtn * (sMtn1 + sMtn2 + sMtn3 + sMtn4 + sMtn5) / 25
+sHwf1 = mh15 < mhP15 ? 5.0 : 0.0
+sHwf2 = rsi15 < inRsiMid ? 5.0 : 0.0
+sHwf3 = diM15 > diP15 ? 5.0 : 0.0
+scoreHwfL = wHwf * (sHwf1 + sHwf2 + sHwf3) / 15
+sFlp1 = not na(crUpAE) and crUpAE <= inRecency ? 5.0 : 0.0
+sFlp2 = not na(mcrUpAE) and mcrUpAE <= inRecency ? 5.0 : 0.0
+scoreFlpL = wFlp * (sFlp1 + sFlp2) / 10
+sRvl1 = volume > inVolMult * vAvgE ? 5.0 : 0.0
+sRvl2 = vUpE ? 5.0 : 0.0
+sRvl3 = close > open and volume > vAvgE ? 5.0 : 0.0
+scoreRvlL = wRvl * (sRvl1 + sRvl2 + sRvl3) / 15
+sRst1 = plValidE and low <= lastPlE + 0.5 * atrE and close > lastPlE ? 5.0 : 0.0
+sRst2 = eMrE ? 5.0 : 0.0
+scoreRstL = wRst * (sRst1 + sRst2) / 10
+revScoreLongTotal = scoreRejL + scoreMtnL + scoreHwfL + scoreFlpL + scoreRvlL + scoreRstL
+
+sRej1S = phValidE and high >= lastPhE - 0.25 * atrE ? 5.0 : 0.0
+sRej2S = close < open ? 5.0 : 0.0
+sRej3S = (high - close) >= math.max(0.3 * atrE, 0.4 * (high - low)) ? 5.0 : 0.0
+sRej4S = pBullE ? 5.0 : 0.0
+sRej5S = rsiE < inRsiOb and rsiE >= inRsiWeak ? 5.0 : 0.0
+scoreRejS = wRej * (sRej1S + sRej2S + sRej3S + sRej4S + sRej5S) / 25
+sMtn1S = rsiE < rsiPE ? 5.0 : 0.0
+sMtn2S = macdHistE < mhPE ? 5.0 : 0.0
+sMtn3S = not na(mcrDnAE) and mcrDnAE <= inRecency ? 5.0 : 0.0
+sMtn4S = mhPE > 0 ? 5.0 : 0.0
+sMtn5S = rsiE < inRsiWeak ? 5.0 : 0.0
+scoreMtnS = wMtn * (sMtn1S + sMtn2S + sMtn3S + sMtn4S + sMtn5S) / 25
+sHwf1S = mh15 > mhP15 ? 5.0 : 0.0
+sHwf2S = rsi15 > inRsiMid ? 5.0 : 0.0
+sHwf3S = diP15 > diM15 ? 5.0 : 0.0
+scoreHwfS = wHwf * (sHwf1S + sHwf2S + sHwf3S) / 15
+sFlp1S = not na(crDnAE) and crDnAE <= inRecency ? 5.0 : 0.0
+sFlp2S = not na(mcrDnAE) and mcrDnAE <= inRecency ? 5.0 : 0.0
+scoreFlpS = wFlp * (sFlp1S + sFlp2S) / 10
+sRvl1S = volume > inVolMult * vAvgE ? 5.0 : 0.0
+sRvl2S = vUpE ? 5.0 : 0.0
+sRvl3S = close < open and volume > vAvgE ? 5.0 : 0.0
+scoreRvlS = wRvl * (sRvl1S + sRvl2S + sRvl3S) / 15
+sRst1S = phValidE and high >= lastPhE - 0.5 * atrE and close < lastPhE ? 5.0 : 0.0
+sRst2S = eMrDnE ? 5.0 : 0.0
+scoreRstS = wRst * (sRst1S + sRst2S) / 10
+revScoreShortTotal = scoreRejS + scoreMtnS + scoreHwfS + scoreFlpS + scoreRvlS + scoreRstS
+
+// ════════════════════════════════════════════════════════════════════════════
+// GATES + SIGNALS
+// ════════════════════════════════════════════════════════════════════════════
+thrNow = isScalp ? inScalpThr : inRevThr
+BIG = 1e18
+roomLong = phValidE and lastPhE > close ? lastPhE - close : BIG
+roomShort = plValidE and lastPlE < close ? close - lastPlE : BIG
+regimeOk = not inBlockAbnormal or regime != 3
+vwapLongOk = not inVwapGate or close > vwE
+vwapShortOk = not inVwapGate or close < vwE
+roomLongOk = not inRequireRoom or roomLong >= inMinRoomAtr * atrE
+roomShortOk = not inRequireRoom or roomShort >= inMinRoomAtr * atrE
+trendLongOk = inStrictTrend ? trend45 == 1 : trend45 != -1
+trendShortOk = inStrictTrend ? trend45 == -1 : trend45 != 1
+revLongOk = trend45 != 1
+revShortOk = trend45 != -1
+
+longSig = (
+    isScalp ? scoreLongTotal >= inScalpThr and trendLongOk and regimeOk and vwapLongOk and roomLongOk :
+    revScoreLongTotal >= inRevThr and revLongOk and regimeOk and vwapLongOk and roomLongOk)
+shortSig = (
+    isScalp ? scoreShortTotal >= inScalpThr and trendShortOk and regimeOk and vwapShortOk and roomShortOk :
+    revScoreShortTotal >= inRevThr and revShortOk and regimeOk and vwapShortOk and roomShortOk)
+
+// ════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT (paper levels + strategy orders)
+// ════════════════════════════════════════════════════════════════════════════
+var float stopPx = na
+var float tgtPx = na
+var float lastExitPxStrat = na
+var string lastExitReasonStrat = ""
+
+// per-bar close bookkeeping (re-initialized every bar)
+string exitReasonBar = ""
+float exitPxBar = na
+
+longEntryFill = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortEntryFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// exits first (so a stop/target on this bar is honored before any reversal)
+// TREND-FLIP exits are SCALP-only: a reversal long ENTERS on a bearish 45m
+// trend, so flipping against the position is the normal entry state there.
+if strategy.position_size > 0 and inTrendExit and isScalp and trend45 == -1 and not shortSig
+    exitReasonBar := "TREND FLIP"
+    exitPxBar := close
+    strategy.close("Long", comment = "TREND FLIP")
+    strategy.cancel("L-Exit", "Long")
+    stopPx := na
+    tgtPx := na
+if strategy.position_size < 0 and inTrendExit and isScalp and trend45 == 1 and not longSig
+    exitReasonBar := "TREND FLIP"
+    exitPxBar := close
+    strategy.close("Short", comment = "TREND FLIP")
+    strategy.cancel("S-Exit", "Short")
+    stopPx := na
+    tgtPx := na
+
+if strategy.position_size > 0 and shortSig
+    exitReasonBar := "REVERSAL"
+    exitPxBar := close
+    strategy.close("Long", comment = "REVERSAL")
+    strategy.cancel("L-Exit", "Long")
+    stopPx := na
+    tgtPx := na
+    strategy.entry("Short", strategy.short)
+    stopPx := close + inStopAtr * atrE
+    tgtPx := close - inTgtAtr * atrE
+    strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+else if strategy.position_size < 0 and longSig
+    exitReasonBar := "REVERSAL"
+    exitPxBar := close
+    strategy.close("Short", comment = "REVERSAL")
+    strategy.cancel("S-Exit", "Short")
+    stopPx := na
+    tgtPx := na
+    strategy.entry("Long", strategy.long)
+    stopPx := close - inStopAtr * atrE
+    tgtPx := close + inTgtAtr * atrE
+    strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
+else if strategy.position_size == 0 and longSig
+    strategy.entry("Long", strategy.long)
+    stopPx := close - inStopAtr * atrE
+    tgtPx := close + inTgtAtr * atrE
+    strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
+else if strategy.position_size == 0 and shortSig
+    strategy.entry("Short", strategy.short)
+    stopPx := close + inStopAtr * atrE
+    tgtPx := close - inTgtAtr * atrE
+    strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+
+plotshape(longEntryFill, title = "Long entry", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+plotshape(shortEntryFill, title = "Short entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
+plot(strategy.position_size > 0 ? stopPx : na, "Stop (long)", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size > 0 ? tgtPx : na, "Target (long)", color = color.new(color.green, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? stopPx : na, "Stop (short)", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size < 0 ? tgtPx : na, "Target (short)", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ════════════════════════════════════════════════════════════════════════════
+// PERFORMANCE BY MARKET REGIME (manual attribution at trade close)
+// ════════════════════════════════════════════════════════════════════════════
+var int regAtEntry = 0
+var int tUp = 0, tDn = 0, tRng = 0, tAbn = 0
+var int wUp = 0, wDn = 0, wRng = 0, wAbn = 0
+var float gpUp = 0.0, glUp = 0.0
+var float gpDn = 0.0, glDn = 0.0
+var float gpRng = 0.0, glRng = 0.0
+var float gpAbn = 0.0, glAbn = 0.0
+var float npUp = 0.0, npDn = 0.0, npRng = 0.0, npAbn = 0.0
+var int totalTrades = 0, totalWins = 0
+var float grossProfitAll = 0.0, grossLossAll = 0.0
+
+if longEntryFill or shortEntryFill
+    regAtEntry := regime
+
+closeEv = strategy.closedtrades > strategy.closedtrades[1]
+
+// ── attribute the close: the strategy API does not expose close reasons, so
+//    infer STOP/TARGET from bar OHLC vs the pending levels (stop-first rule).
+if closeEv and exitReasonBar == "" and strategy.position_size == 0 and not longEntryFill and not shortEntryFill
+    if strategy.position_size[1] > 0
+        if not na(stopPx) and low <= stopPx
+            exitReasonBar := "STOP"
+            exitPxBar := open < stopPx ? open : stopPx
+        else if not na(tgtPx) and high >= tgtPx
+            exitReasonBar := "TARGET"
+            exitPxBar := open > tgtPx ? open : tgtPx
+    else if strategy.position_size[1] < 0
+        if not na(stopPx) and high >= stopPx
+            exitReasonBar := "STOP"
+            exitPxBar := open > stopPx ? open : stopPx
+        else if not na(tgtPx) and low <= tgtPx
+            exitReasonBar := "TARGET"
+            exitPxBar := open < tgtPx ? open : tgtPx
+if closeEv
+    if exitReasonBar != ""
+        lastExitReasonStrat := exitReasonBar
+        lastExitPxStrat := exitPxBar
+    // clear stale levels once flat (a flip bar already set the new levels)
+    if strategy.position_size == 0 and not longEntryFill and not shortEntryFill
+        stopPx := na
+        tgtPx := na
+    tradePnl = strategy.netprofit - strategy.netprofit[1]
+    totalTrades += 1
+    if tradePnl > 0
+        totalWins += 1
+        grossProfitAll += tradePnl
+    else
+        grossLossAll += math.abs(tradePnl)
+    if regAtEntry == 1
+        tUp += 1
+        npUp += tradePnl
+        if tradePnl > 0
+            wUp += 1
+            gpUp += tradePnl
+        else
+            glUp += math.abs(tradePnl)
+    else if regAtEntry == -1
+        tDn += 1
+        npDn += tradePnl
+        if tradePnl > 0
+            wDn += 1
+            gpDn += tradePnl
+        else
+            glDn += math.abs(tradePnl)
+    else if regAtEntry == 3
+        tAbn += 1
+        npAbn += tradePnl
+        if tradePnl > 0
+            wAbn += 1
+            gpAbn += tradePnl
+        else
+            glAbn += math.abs(tradePnl)
+    else
+        tRng += 1
+        npRng += tradePnl
+        if tradePnl > 0
+            wRng += 1
+            gpRng += tradePnl
+        else
+            glRng += math.abs(tradePnl)
+    regAtEntry := 0
+
+pfAll = grossLossAll > 0 ? grossProfitAll / grossLossAll : grossProfitAll > 0 ? 100.0 : 0.0
+winRateAll = totalTrades > 0 ? totalWins / totalTrades * 100 : 0.0
+f_regPF(gp, gl) =>
+    gl > 0 ? gp / gl : gp > 0 ? 100.0 : 0.0
+f_regWin(w, t) =>
+    t > 0 ? w / t * 100 : 0.0
+
+// ════════════════════════════════════════════════════════════════════════════
+// STATS TABLE
+// ════════════════════════════════════════════════════════════════════════════
+var table tbl = na
+if inShowTable and barstate.islast
+    table.delete(tbl)
+    tbl := table.new(position.top_right, 5, 10, border_width = 1, border_color = color.new(color.silver, 70), frame_width = 1, frame_color = color.new(color.silver, 50))
+    hdrBg = color.new(color.blue, 30)
+    tbl.cell(0, 0, syminfo.ticker + " SIGNAL ENGINE STRATEGY", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(1, 0, inMode, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(2, 0, "chart " + timeframe.period, text_color = tfWarn ? color.new(color.yellow, 0) : color.white, bgcolor = tfWarn ? color.new(color.red, 40) : hdrBg, text_size = size.small)
+    tbl.cell(3, 0, "v1.0", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(4, 0, tfWarn ? "⚠ chart TF ≠ entry TF" : "OK", text_color = tfWarn ? color.new(color.yellow, 0) : color.white, bgcolor = tfWarn ? color.new(color.red, 40) : hdrBg, text_size = size.small)
+
+    tbl.cell(0, 1, "NET PROFIT", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 1, str.tostring(strategy.netprofit, "0.00"), text_color = strategy.netprofit >= 0 ? color.new(color.lime, 0) : color.new(color.red, 0), text_size = size.small)
+    tbl.cell(2, 1, "PF " + str.tostring(pfAll, "0.00"), text_color = pfAll >= 1 ? color.new(color.lime, 0) : color.new(color.red, 0), text_size = size.small)
+    tbl.cell(3, 1, "MAX DD " + str.tostring(strategy.max_drawdown(), "0.00") + "%", text_color = color.silver, text_size = size.small)
+    tbl.cell(4, 1, "WIN " + str.tostring(winRateAll, "0.0") + "% (" + str.tostring(totalTrades) + ")", text_color = color.silver, text_size = size.small)
+
+    tbl.cell(0, 2, "REGIME", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    tbl.cell(1, 2, "TRADES / WIN%", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    tbl.cell(2, 2, "PF", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    table.merge_cells(tbl, 3, 2, 4, 2)
+    tbl.cell(3, 2, "NET (USDT)", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    tbl.cell(0, 3, "TREND UP", text_color = color.new(color.green, 30), text_size = size.small)
+    tbl.cell(1, 3, str.tostring(tUp) + " / " + str.tostring(f_regWin(wUp, tUp), "0.0") + "%", text_size = size.small)
+    tbl.cell(2, 3, str.tostring(f_regPF(gpUp, glUp), "0.00"), text_size = size.small)
+    table.merge_cells(tbl, 3, 3, 4, 3)
+    tbl.cell(3, 3, str.tostring(npUp, "0.00"), text_color = npUp >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+    tbl.cell(0, 4, "TREND DOWN", text_color = color.new(color.red, 30), text_size = size.small)
+    tbl.cell(1, 4, str.tostring(tDn) + " / " + str.tostring(f_regWin(wDn, tDn), "0.0") + "%", text_size = size.small)
+    tbl.cell(2, 4, str.tostring(f_regPF(gpDn, glDn), "0.00"), text_size = size.small)
+    table.merge_cells(tbl, 3, 4, 4, 4)
+    tbl.cell(3, 4, str.tostring(npDn, "0.00"), text_color = npDn >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+    tbl.cell(0, 5, "RANGING", text_color = color.silver, text_size = size.small)
+    tbl.cell(1, 5, tRng > 0 ? str.tostring(tRng) + " / " + str.tostring(f_regWin(wRng, tRng), "0.0") + "%" : "—", text_size = size.small)
+    tbl.cell(2, 5, str.tostring(f_regPF(gpRng, glRng), "0.00"), text_size = size.small)
+    table.merge_cells(tbl, 3, 5, 4, 5)
+    tbl.cell(3, 5, str.tostring(npRng, "0.00"), text_color = npRng >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+    tbl.cell(0, 6, "ABNORMAL VOL", text_color = color.new(color.orange, 30), text_size = size.small)
+    tbl.cell(1, 6, str.tostring(tAbn) + " / " + str.tostring(f_regWin(wAbn, tAbn), "0.0") + "%", text_size = size.small)
+    tbl.cell(2, 6, str.tostring(f_regPF(gpAbn, glAbn), "0.00"), text_size = size.small)
+    table.merge_cells(tbl, 3, 6, 4, 6)
+    tbl.cell(3, 6, str.tostring(npAbn, "0.00"), text_color = npAbn >= 0 ? color.new(color.green, 20) : color.new(color.red, 20), text_size = size.small)
+
+    tbl.cell(0, 7, "POSITION", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", text_color = strategy.position_size > 0 ? color.new(color.green, 0) : strategy.position_size < 0 ? color.new(color.red, 0) : color.silver, text_size = size.small)
+    tbl.cell(2, 7, na(stopPx) ? "S —" : "S " + str.tostring(stopPx, format.mintick), text_color = color.new(color.red, 20), text_size = size.small)
+    tbl.cell(3, 7, na(tgtPx) ? "T —" : "T " + str.tostring(tgtPx, format.mintick), text_color = color.new(color.green, 20), text_size = size.small)
+    tbl.cell(4, 7, "R/R " + str.tostring(inTgtAtr / inStopAtr, "0.00") + ":1", text_size = size.small)
+
+    tbl.cell(0, 8, "BIAS / REGIME", text_color = color.gray, text_size = size.small)
+    tbl.cell(1, 8, "45M " + bias45Label, text_color = bias45 == 1 ? color.new(color.green, 0) : bias45 == -1 ? color.new(color.red, 0) : color.silver, text_size = size.small)
+    tbl.cell(2, 8, regimeLabel, text_color = regime == 3 ? color.new(color.orange, 0) : color.white, bgcolor = regime == 3 ? color.new(color.orange, 60) : na, text_size = size.small)
+    tbl.cell(3, 8, "SCORE L " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " S " + str.tostring(math.round(nz(isScalp ? scoreShortTotal : revScoreShortTotal)), "0") + " (thr " + str.tostring(thrNow) + ")", text_color = color.silver, text_size = size.small)
+    tbl.cell(4, 8, "fee " + str.tostring(inFeePct, "0.00") + "% · slip " + str.tostring(inSlipTicks) + "tk", text_color = color.silver, text_size = size.small)
+
+    tbl.cell(0, 9, "NOTES", text_color = color.gray, text_size = size.small)
+    table.merge_cells(tbl, 1, 9, 4, 9)
+    tbl.cell(1, 9, "entry = signal-bar close · fees & slippage applied · stop-before-target tie-break · non-repainting HTF data", text_color = color.new(color.white, 40), text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALERTS — identical contract to the indicator (webhook JSON ready)
+// ════════════════════════════════════════════════════════════════════════════
+exitLongEv = closeEv and strategy.position_size <= 0 and strategy.position_size[1] > 0
+exitShortEv = closeEv and strategy.position_size >= 0 and strategy.position_size[1] < 0
+
+alertcondition(longEntryFill, "Signal Engine – BUY", "SIGNAL ENGINE: BUY on {{ticker}} ({{interval}})")
+alertcondition(shortEntryFill, "Signal Engine – SELL", "SIGNAL ENGINE: SELL on {{ticker}} ({{interval}})")
+alertcondition(exitLongEv, "Signal Engine – EXIT LONG", "SIGNAL ENGINE: EXIT LONG on {{ticker}} ({{interval}})")
+alertcondition(exitShortEv, "Signal Engine – EXIT SHORT", "SIGNAL ENGINE: EXIT SHORT on {{ticker}} ({{interval}})")
+alertcondition(trendChangeEv, "Signal Engine – Trend change (HTF)", "SIGNAL ENGINE: 45m trend change on {{ticker}} ({{interval}})")
+alertcondition(regimeChangeEv, "Signal Engine – Regime change", "SIGNAL ENGINE: regime change on {{ticker}} ({{interval}})")
+
+posLabel = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+f_compScalp(side) =>
+    "\"trend45\":" + str.tostring(math.round(nz(side > 0 ? scoreT45L : scoreT45S)), "0") + ',"mom15":' + str.tostring(math.round(nz(side > 0 ? scoreM15L : scoreM15S)), "0") + ',"ema5":' + str.tostring(math.round(nz(side > 0 ? scoreE5L : scoreE5S)), "0") + ',"rsi":' + str.tostring(math.round(nz(side > 0 ? scoreRsiL : scoreRsiS)), "0") + ',"macd":' + str.tostring(math.round(nz(side > 0 ? scoreMcdL : scoreMcdS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreVolL : scoreVolS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreStrL : scoreStrS)), "0")
+f_compRev(side) =>
+    "\"rejection\":" + str.tostring(math.round(nz(side > 0 ? scoreRejL : scoreRejS)), "0") + ',"momentum":' + str.tostring(math.round(nz(side > 0 ? scoreMtnL : scoreMtnS)), "0") + ',"htf_weakening":' + str.tostring(math.round(nz(side > 0 ? scoreHwfL : scoreHwfS)), "0") + ',"flip":' + str.tostring(math.round(nz(side > 0 ? scoreFlpL : scoreFlpS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreRvlL : scoreRvlS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreRstL : scoreRstS)), "0")
+f_comp(side) =>
+    isScalp ? f_compScalp(side) : f_compRev(side)
+f_json(event, side, px, scoreVal, compJson, reason) =>
+    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(time, "0") + ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (strategy.position_size == 0 ? "null" : str.tostring(strategy.position_avg_price, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
+
+if inAlerts and inJsonAlerts and longEntryFill
+    alert(f_json("BUY", "LONG", close, isScalp ? scoreLongTotal : revScoreLongTotal, f_comp(1), "score " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and longEntryFill
+    alert("SIGNAL ENGINE BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and shortEntryFill
+    alert(f_json("SELL", "SHORT", close, isScalp ? scoreShortTotal : revScoreShortTotal, f_comp(-1), "score " + str.tostring(math.round(nz(isScalp ? scoreShortTotal : revScoreShortTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and shortEntryFill
+    alert("SIGNAL ENGINE SELL " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and exitLongEv
+    alert(f_json("EXIT_LONG", "LONG", lastExitPxStrat, na, "", lastExitReasonStrat + " @ " + str.tostring(nz(lastExitPxStrat), format.mintick)), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and exitLongEv
+    alert("SIGNAL ENGINE EXIT LONG " + syminfo.ticker + " " + lastExitReasonStrat, alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and exitShortEv
+    alert(f_json("EXIT_SHORT", "SHORT", lastExitPxStrat, na, "", lastExitReasonStrat + " @ " + str.tostring(nz(lastExitPxStrat), format.mintick)), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and exitShortEv
+    alert("SIGNAL ENGINE EXIT SHORT " + syminfo.ticker + " " + lastExitReasonStrat, alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and trendChangeEv
+    alert(f_json("TREND_CHANGE", bias45 > 0 ? "LONG" : bias45 < 0 ? "SHORT" : "FLAT", na, na, "", "HTF bias -> " + bias45Label), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and trendChangeEv
+    alert("SIGNAL ENGINE TREND CHANGE " + syminfo.ticker + " -> " + bias45Label, alert.freq_once_per_bar)
+if inAlerts and inJsonAlerts and regimeChangeEv
+    alert(f_json("REGIME_CHANGE", "FLAT", na, na, "", regimeLabel), alert.freq_once_per_bar)
+if inAlerts and not inJsonAlerts and regimeChangeEv
+    alert("SIGNAL ENGINE REGIME CHANGE " + syminfo.ticker + " -> " + regimeLabel, alert.freq_once_per_bar)

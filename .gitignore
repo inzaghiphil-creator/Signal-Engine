@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# backtest output artifacts (regenerable via CLI --out-trades)
+data/trades_*.csv
+# real exchange exports (local only — see docs/NEXT_STEPS.md)
+data/*_real*.csv
