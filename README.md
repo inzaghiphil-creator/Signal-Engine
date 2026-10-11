@@ -137,40 +137,19 @@ python -m backtester.sample_data --out data/sample_near_5m_synth.csv --days 100
 python -m backtester --csv data/sample_near_5m_synth.csv --mode scalp
 
 # your real export (TradingView or KuCoin format — see data/README.md)
-python -m backtester --csv data/near_5m.csv --mode scalp   # slippage auto = 2 minticks from the CSV's price precision
+python -m backtester --csv data/near_5m.csv --mode scalp --fee-pct 0.1 --slippage-pct 0.02
 python -m backtester --csv data/near_5m.csv --mode reversal --out-trades data/trades.csv
 python tests/smoke_test.py   # non-repainting truncation test + engine invariants
 ```
 
 CLI mirrors the Pine settings: `--mode`, `--threshold`, `--stop-atr`,
 `--target-atr`, `--min-room-atr`, `--fee-pct`, `--slippage-pct`, `--qty-pct`,
-`--no-strict-trend`, `--vwap-gate`, `--no-block-abnormal`, `--out-trades`,
-`--out-signals` (per-bar scores/signals/regime CSV), `--check-norepaint`
-(truncation test on your own data — exits non-zero on any mismatch), …
-(run `python -m backtester --help`).
+`--no-strict-trend`, `--vwap-gate`, `--no-block-abnormal`, … (run
+`python -m backtester --help`).
 
-**Equivalence with the Pine strategy:** entry at signal-bar close, slippage
-on **all fills** (entries and exits, adverse direction) at the *same tick
-count* (default 2 minticks — resolved per symbol from the export, matching
-the strategy's `Slippage (ticks)` input), stop-before-target tie-break, gap
-fills at the open, same fee model, same 10%-of-equity sizing.
+**Equivalence with the Pine strategy:** entry at signal-bar close ± slippage,
+stop-before-target tie-break, same fee model, same 10%-of-equity sizing.
 Known minor deltas are listed in `docs/SIGNAL_SPEC.md` §11.
-
-### Validation tooling (analysis only — no model changes)
-
-```bash
-# data quality gate (run first on any real export)
-python -m backtester.check_data --csv data/near_5m_real.csv --window 2026-10-08,2026-10-10
-# loss taxonomy: WHY did losing trades happen (MFE/MAE, cost sensitivity)
-python -m backtester.diagnose --csv data/near_5m_real.csv --mode scalp
-# out-of-sample: optimise on train, validate once on test
-python -m backtester.oos --csv data/near_5m_real.csv --mode scalp --train-end 2026-08-31
-# TradingView strategy export vs Python trades
-python -m backtester.compare --py-trades py_trades.csv --tv-trades tv_trades.csv
-```
-
-The current development cycle (real data, loss diagnosis, OOS, TradingView
-verification, acceptance gates) is specified in **`docs/NEXT_STEPS.md`**.
 
 ### Running the non-repainting check
 
@@ -205,47 +184,3 @@ automation can route accordingly.
 5. Only after validation: extend the JSON alerts toward KuCoin automation
    (the payload already carries entry/stop/target, score, regime and position
    state — nothing order-related, by design, in this release).
-
----
-
-## Changelog
-
-### v2.0.0
-
-**Correctness fixes (found by adversarial self-review):**
-
-- **Gates silently disabled (Python)** — the regime/VWAP/room gates used
-  `~` (bitwise NOT) on Python bools, where `~True == -2` (truthy), so every
-  gate evaluated to `True` and never filtered anything. Fixed to logical
-  `not`; now covered by dedicated tests (room filter, abnormal-vol block,
-  VWAP gate invariants). Pine was unaffected (`not` is logical in Pine).
-- **Exit fills had no slippage (Python)** — slippage was applied to entries
-  only, unlike the Pine strategy tester which slips every fill. Now applied
-  to all fills in all implementations; spec §8/§9 updated.
-- **Stale stop/target display in the Pine strategy** — after a stop/target
-  fill the table kept showing the previous levels; levels are now cleared
-  when flat, and the JSON exit alert infers STOP/TARGET from bar OHLC vs the
-  pending levels (the strategy API does not expose close reasons).
-
-**Upgrades:**
-
-- Pine data layer split into role-specific packs — 45m trend: 5 fields,
-  15m momentum: 14, 5m entry: 29 (was one 35-field pack fetched three
-  times) — lower compile cost and a clearer contract per TF.
-- Python per-TF frames built by role (trend/mid/entry) — fewer wasted
-  indicator passes.
-- Report: per-direction (LONG/SHORT) stats, average bars held, and an
-  explicit "open position at data end" note (excluded from stats, as in
-  the strategy tester).
-- New CLI: `--out-signals` (per-bar scores/signals/regime export) and
-  `--check-norepaint` (truncation test on your own data).
-- Test suite: 26 checks — added exact exit-slippage recompute for every
-  trade, filter invariants, gap-fill unit test (forced signal), no-trend-flip
-  in reversal mode, open-position reporting.
-- Alert JSON schema version bumped to `2.0.0`.
-
-### v1.0.0
-
-Initial release: multi-timeframe weighted-scoring indicator (SCALP +
-REVERSAL), equivalent strategy with regime attribution, Python backtester,
-webhook-ready JSON alerts, synthetic sample + smoke tests.
