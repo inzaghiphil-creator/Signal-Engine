@@ -1,0 +1,325 @@
+// This source file is subject to the terms of the Mozilla Public License 2.0
+// https://www.mozilla.org/MPL/2.0/
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  GRID BOX GUARDIAN v1 — grid-window timing research indicator
+//  Pine Script v6 · TradingView · default chart: 1H (guardian stats are
+//  referenced on 1H). The LONG GRID SETUP block is TF-relative: its box is
+//  N chart bars, so on a 5m chart set box = 48 for the pre-registered
+//  4h box (docs/GRID_START_SIGNAL.md §4.2).
+//
+//  ┌─────────────────────────────────────────────────────────────────────────┐
+//  │  CHARTER: SIGNAL-ENGINE-GRID-WINDOW-DETECTOR (authorised 2026-10-13).  │
+//  │  Separate workstream from the RETIRED NEAR 5m signal family — this is   │
+//  │  grid-window RESEARCH/monitoring tooling, NOT an authorised trade       │
+//  │  recommendation, and no part of this repository authorises orders.      │
+//  │  Signals & alerts only. See docs/GRID_WINDOW.md.                        │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//
+//  WHAT IT DOES
+//    • Draws the current 20-bar Donchian BOX (the grid's range) and tracks
+//      it bar by bar while price stays inside.
+//    • State machine (parity with backtester/grid_window.py, pre-registered
+//      parameters, frozen 2026-10-13 before scoring):
+//        EXPOSED_UP / EXPOSED_DN  close beyond the 20-bar channel edge
+//        BREAK_SIG                inside, but bar range >= 2 × ATR(14)
+//        SETTLING                 inside, but < 3 bars since last exit
+//        COILED                   BB(20,2) width rank in bottom decile
+//                                  of its trailing 720-bar window
+//        TRENDING                 ADX(14) >= 22
+//        CALM_SIG                 recent 2σ bar inside the 24-bar lookback —
+//                                  do not trust the calm
+//        DEPLOYABLE               inside, settled, uncoiled, ADX < 22, no
+//                                  recent 2σ bar
+//    • CUSHION gauge: distance from close to the NEARST box edge in ATR
+//      units — "how much adverse move can this box absorb". Reference
+//      (1h NEAR, Jun 15 → Oct 10 2026, pre-registered run):
+//        cushion <= 1 ATR → 49% chance of a break/2σ bar within 6h
+//        cushion >  2 ATR → 15% within 6h
+//    • BTC TRIPWIRE (soft exit): BTC's own 20-bar channel state via
+//      request.security (last CONFIRMED BTC bar — non-repainting). NEAR is
+//      high-beta to BTC; BTC breaking its box leads NEAR breaking its box.
+//    • WINDOW JOURNAL: the last N boxes with duration and exit side.
+//    • Alerts: DEPLOY_OK / HARD_EXIT / SOFT_EXIT_BTC / SIGMA_BAR, classic
+//      alertcondition + optional webhook-ready JSON (monitoring only).
+//
+//  SYNC — state machine and parameters must stay identical to
+//    backtester/grid_window.py (docs/GRID_WINDOW.md is the charter record).
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("Grid Box Guardian", "Grid Box Guardian v1 [1h grid-timing research]", shorttitle = "GridBox", overlay = true, max_boxes_count = 50, max_labels_count = 300)
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS (defaults = pre-registered parameters, frozen before scoring)
+// ════════════════════════════════════════════════════════════════════════════
+inDon      = input.int(20,     "Donchian bars",          minval = 5,    group = "Box")
+inAtrLen   = input.int(14,     "ATR length",             minval = 2,    group = "Box")
+inAdxLen   = input.int(14,     "ADX length",             minval = 2,    group = "Regime")
+inAdxMax   = input.float(22.0, "ADX deploy ceiling",     minval = 5,    maxval = 60, step = 0.5, group = "Regime")
+inSig      = input.float(2.0,  "Sigma bar (×ATR)",       minval = 0.5,  step = 0.1, group = "Danger")
+inVolLen   = input.int(20,     "Volume SMA",             minval = 2,    group = "Danger")
+inVolX     = input.float(2.0,  "Volume surge ×",         minval = 0.5,  step = 0.1, group = "Danger")
+inRecont   = input.int(3,      "Recontain bars",         minval = 1,    group = "Regime")
+inBbLen    = input.int(20,     "BB length",              minval = 5,    group = "Coil")
+inBbK      = input.float(2.0,  "BB width (σ)",           minval = 0.5,  step = 0.1, group = "Coil")
+inBbRankN  = input.int(720,    "BB rank window (bars)",  minval = 50,   group = "Coil")
+inBbRankMin= input.int(100,    "BB rank min bars",       minval = 20,   group = "Coil")
+inBbRankMax= input.float(0.10, "Coiled rank ceiling",    minval = 0.01, maxval = 0.5, step = 0.01, group = "Coil")
+inSigLook  = input.int(24,     "Sigma lookback (bars)",  minval = 2,    group = "Regime")
+inLgBox      = input.int(24,   "LONG GRID box (bars)",   minval = 2,    group = "Long grid", tooltip = "Consolidation box length in chart bars. Pre-registered: 24 on 1H (1-day box); 48 on 5m (4h box — 5m run, docs §4.2).")
+inLgReclaim  = input.int(12,   "LONG GRID reclaim (bars)", minval = 1,  group = "Long grid", tooltip = "Bars allowed for the reclaim after the sweep bar (incl. the sweep bar): 12 = 12h on 1H, 1h on 5m.")
+inLgCooldown = input.int(48,   "LONG GRID cooldown (bars)", minval = 1, group = "Long grid", tooltip = "Minimum bars between setups: 48 on 1H (=48h); 576 on 5m (=48h).")
+inBtcSym   = input.symbol("BINANCE:BTCUSDT", "BTC tripwire symbol", group = "Tripwire", tooltip = "Set to the BTC pair of YOUR chart feed (e.g. KOIN:BTCUSDT on KuCoin).")
+inBtcTF    = input.timeframe("60", "BTC tripwire TF", group = "Tripwire")
+inShowTable= input.bool(true,  "Stats table",            group = "Display")
+inShowBox  = input.bool(true,  "Draw current box",       group = "Display")
+inJournalN = input.int(8,      "Journal rows",           minval = 2,    maxval = 20, group = "Display")
+inJsonAlerts = input.bool(true, "Webhook JSON payload",  group = "Alerts", tooltip = "Structured JSON for monitoring dashboards. No orders are ever sent.")
+
+// pre-registered (timeframe, box) pairs: 1H → 24 bars (1-day box), 5m → 48 bars (4h box).
+// any other combination is not pre-registered → warn.
+tfWarn = not ((timeframe.period == "60" and inLgBox == 24) or (timeframe.period == "5" and inLgBox == 48))
+
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURES (parity with backtester/grid_window.py — completed bars only)
+// ════════════════════════════════════════════════════════════════════════════
+atr = ta.atr(inAtrLen)
+[pdi, mdi, adx] = ta.dmi(inAdxLen, inAdxLen)
+
+// channel = last 20 COMPLETED bars ([1] — non-repainting)
+upChan = ta.highest(high, inDon)[1]
+dnChan = ta.lowest(low, inDon)[1]
+volMa  = ta.sma(volume, inVolLen)[1]
+
+sig      = (high - low) >= inSig * atr
+volSpike = volume >= inVolX * volMa
+brkUp    = close > upChan
+brkDn    = close < dnChan
+inside   = close <= upChan and close >= dnChan
+
+// consecutive-inside run length (recontainment); na-safe
+insideRun = nz(ta.barssince(not inside), bar_index + 1)
+recont    = inside and insideRun >= inRecont
+
+bbBasis  = ta.sma(close, inBbLen)
+bbw      = inBbK * 2.0 * ta.stdev(close, inBbLen) / bbBasis
+bbLo     = ta.lowest(bbw, inBbRankN)
+bbHi     = ta.highest(bbw, inBbRankN)
+bbRank   = bbHi > bbLo ? (bbw - bbLo) / (bbHi - bbLo) : na
+coiled   = bar_index + 1 >= inBbRankMin and not na(bbRank) and bbRank <= inBbRankMax
+
+// recent 2σ bar within the lookback window (window = last inSigLook bars
+// INCLUDING current; the current bar is routed to BREAK_SIG first, so this
+// reduces to barssince in [1, inSigLook-1] — matches pandas rolling(24))
+sigAgo    = ta.barssince(sig)
+sigRecent = not na(sigAgo) and sigAgo < inSigLook
+
+state = brkUp     ? "EXPOSED_UP" :
+        brkDn     ? "EXPOSED_DN" :
+        sig       ? "BREAK_SIG" :
+        not recont? "SETTLING" :
+        coiled    ? "COILED" :
+        adx >= inAdxMax ? "TRENDING" :
+        sigRecent ? "CALM_SIG" :
+        "DEPLOYABLE"
+
+// cushion — distance to the NEARST edge, in ATR units
+cushDown = (close - dnChan) / atr
+cushUp   = (upChan - close) / atr
+cushNear = math.min(nz(cushDown), nz(cushUp))
+boxW     = nz((upChan - dnChan) / atr)
+cushSide = close <= (upChan + dnChan) / 2 ? "down" : "up"
+
+// ════════════════════════════════════════════════════════════════════════════
+// BTC TRIPWIRE — last CONFIRMED BTC bar (lookahead_off + [1] inside)
+// ════════════════════════════════════════════════════════════════════════════
+f_btc() =>
+    u = ta.highest(high, inDon)[1]
+    d = ta.lowest(low, inDon)[1]
+    [close > u, close < d]
+[btcBrkUp, btcBrkDn] = request.security(inBtcSym, inBtcTF, f_btc(), lookahead = barmerge.lookahead_off)
+btcBrk  = nz(btcBrkUp) or nz(btcBrkDn)
+btcOk   = not btcBrk
+
+// ════════════════════════════════════════════════════════════════════════════
+// LONG GRID SETUP — consolidation → liquidity sweep → reclaim (Phase 2)
+// STATUS (Phase 3, 2026-10-13): no forward edge (kill rule triggered) —
+// WATCHLIST / monitoring trigger only, not a start-signal authorisation.
+// See docs/GRID_START_SIGNAL.md §4.1.
+// Parity with backtester/grid_start.py (pre-registered, frozen 2026-10-13):
+// box = last inLgBox completed bars (24 on 1H = 1 day; 48 on 5m = 4h —
+// pre-registered 5m run), width 2.0-8.0 ATR, drift ≤1.5 ATR, ADX ≤25 ·
+// sweep = first-breach low < box low, depth ≤1.5 ATR ·
+// reclaim = close back in the box within inLgReclaim bars, no close above
+// box top. (Pine cooldown counts from the reclaim bar; Python from the
+// sweep bar — immaterial with 48h cooldown and ~7-day setup spacing.)
+// Single pending sweep: a new sweep bar OVERWRITES the pending one (latest
+// sweep wins — its box and its reclaim window apply). Python runs each
+// sweep's reclaim search independently; on the NEAR Jun→Oct 2026 data that
+// diverges in exactly 1 of 18 setups on 1H (a double-sweep, entries 0.4%
+// apart) and in 0 of 12 on the 5m variant. Pinned by
+// tests/test_pine_parity_grid_start.py.
+// ════════════════════════════════════════════════════════════════════════════
+L24     = ta.lowest(low, inLgBox)[1]
+H24     = ta.highest(high, inLgBox)[1]
+w24     = nz((H24 - L24) / atr)
+drift24 = nz(math.abs(close[1] - close[inLgBox]) / atr)   // parity: Python |close.shift(1) - close.shift(box)|
+boxOk   = w24 >= 2.0 and w24 <= 8.0 and drift24 <= 1.5 and adx <= 25
+// first breach: previous bar must NOT have closed below the box that existed
+// before it (box of bar i-1 = inLgBox lows ending at i-2). (close[1] >= L24
+// would be a tautology: L24 includes bar i-1's own low.)
+sweep   = boxOk and close[1] >= ta.lowest(low, inLgBox)[2] and low < L24 and (L24 - low) / atr <= 1.5
+
+var int   pendSweep = na
+var float pendL = na
+var float pendH = na
+var float pendStop = na
+var int   lastSetup = na
+if sweep
+    pendSweep := bar_index
+    pendL := L24
+    pendH := H24
+    pendStop := low
+setup = false
+if not na(pendSweep)
+    if bar_index > nz(pendSweep) + inLgReclaim - 1
+        pendSweep := na                       // reclaim window expired (inLgReclaim bars, parity)
+    else if close > pendH
+        pendSweep := na                       // breakout in between: dead
+    else if close > pendL
+        if na(lastSetup) or bar_index - lastSetup >= inLgCooldown
+            setup := true
+        lastSetup := bar_index   // parity: an in-box reclaim close advances the
+        pendSweep := na          // cooldown anchor even when it is rejected
+                                 // (grid_start.py: last_sig = k, unconditionally)
+armed = not na(pendSweep)
+
+// Phase 3 gate — DISPLAY ONLY (kill rule triggered; context, not a trigger):
+// 1d close vs 1d 21-EMA, running 1d value (what a live 1D chart shows).
+dClose = request.security(syminfo.tickerid, "D", close, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+dEma21 = request.security(syminfo.tickerid, "D", ta.ema(close, 21), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+gate1d = not na(dClose) and not na(dEma21) and dClose > dEma21
+
+// ════════════════════════════════════════════════════════════════════════════
+// WINDOW JOURNAL — last N boxes: "start → end · hours · exit side"
+// ════════════════════════════════════════════════════════════════════════════
+inWin = state != "EXPOSED_UP" and state != "EXPOSED_DN"
+var array<string> journal = array.new<string>()
+var int winStart = na
+var int winStartTs = na
+if inWin and not inWin[1]
+    winStart := bar_index
+    winStartTs := int(time)
+if not inWin and inWin[1]
+    side  = state == "EXPOSED_UP" ? "UP" : "DN"
+    hrs   = bar_index - nz(winStart, bar_index)
+    entry = str.format("{0} → {1} · {2}h · exit {3}", str.format_time(nz(winStartTs, time), "dd MMM"), str.format_time(time, "dd MMM"), tostring(hrs), side)
+    if array.size(journal) >= inJournalN
+        array.shift(journal)
+    array.unshift(journal, entry)
+    winStart := na
+    winStartTs := na
+winAge = inWin and not na(winStart) ? bar_index - winStart : 0
+
+// ════════════════════════════════════════════════════════════════════════════
+// DRAWING
+// ════════════════════════════════════════════════════════════════════════════
+plot(upChan, "Box top",    color = color.new(color.aqua, 20), linewidth = 1)
+plot(dnChan, "Box bottom", color = color.new(color.aqua, 20), linewidth = 1)
+plotshape(sig, "2σ bar", style = shape.triangle, location = location.belowbar, color = color.new(color.red, 0), size = size.tiny)
+plotshape(sweep, "Liquidity sweep", style = shape.triangledown, location = location.abovebar, color = color.new(color.orange, 0), size = size.small)
+plotshape(setup, "LONG GRID SETUP", style = shape.labelup, location = location.belowbar, color = color.new(color.green, 0), text = "LONG GRID\nstop " + str.tostring(nz(pendStop, low), format.mintick) + (gate1d ? "" : " · 1d gate OFF"), textcolor = color.white, size = size.small)
+
+var box bx = na
+if inShowBox
+    if not inWin and not na(bx)
+        box.delete(bx)
+        bx := na
+    else if inWin and not inWin[1]
+        if not na(bx)
+            box.delete(bx)
+        bx := box.new(bar_index, nz(upChan), bar_index, nz(dnChan), border_color = color.new(color.aqua, 30), bgcolor = color.new(color.aqua, 93), extend = extend.none)
+    else if inWin and not na(bx)
+        box.set_right(bx, bar_index)
+        box.set_up(bx, math.max(nz(box.get_top(bx)), nz(upChan)))
+        box.set_down(bx, math.min(nz(box.get_bottom(bx)), nz(dnChan)))
+
+bgcolor(state == "DEPLOYABLE"    ? color.new(color.green,  88) :
+        state == "EXPOSED_UP"    ? color.new(color.orange, 88) :
+        state == "EXPOSED_DN"    ? color.new(color.red,      88) :
+        state == "BREAK_SIG"     ? color.new(color.red,      72) :
+        state == "COILED"        ? color.new(color.gray,     92) :
+        na)
+
+var label lbState = na
+if state != state[1] and not na(state[1])
+    if not na(lbState)
+        label.delete(lbState)
+    isOut = state == "EXPOSED_UP" or state == "EXPOSED_DN"
+    lbState := label.new(bar_index, isOut ? high : low, state + "\n" + "cush " + str.tostring(cushNear, "#.##") + " ATR",
+         style = isOut ? label.style_label_up : label.style_label_down,
+         color = state == "DEPLOYABLE" ? color.new(color.green, 10) : state == "BREAK_SIG" or isOut ? color.new(color.red, 10) : color.new(color.gray, 20),
+         textcolor = color.white, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+// TABLE
+// ════════════════════════════════════════════════════════════════════════════
+var table tbl = na
+if inShowTable and barstate.islast
+    table.delete(tbl)
+    nJ = array.size(journal)
+    // rows must be a simple int: allocate the max (status rows 0-10 + 20 journal) up front
+    tbl := table.new(position.top_right, 2, 11 + 20, border_width = 1, border_color = color.new(color.silver, 70), frame_width = 1, frame_color = color.new(color.silver, 50))
+    hdrBg = color.new(color.blue, 30)
+    stCol = state == "DEPLOYABLE" ? color.new(color.green, 10) : state == "EXPOSED_UP" or state == "EXPOSED_DN" or state == "BREAK_SIG" ? color.new(color.red, 10) : state == "COILED" ? color.new(color.gray, 30) : color.new(color.blue, 30)
+
+    table.cell(tbl, 0, 0, syminfo.ticker + " GRID BOX GUARDIAN v1", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tbl, 1, 0, (tfWarn ? "⚠ " : "") + syminfo.interval + " · box " + tostring(inLgBox) + " bars", text_color = tfWarn ? color.new(color.yellow, 0) : color.white, bgcolor = tfWarn ? color.new(color.red, 40) : hdrBg, text_size = size.small)
+    table.cell(tbl, 0, 1, "STATE", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 1, state, text_color = color.white, bgcolor = stCol, text_size = size.small)
+    table.cell(tbl, 0, 2, "ADX", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 2, str.tostring(adx, "#.#") + (adx >= inAdxMax ? " ≥ ceiling" : ""), text_color = adx >= inAdxMax ? color.new(color.orange, 0) : color.white, text_size = size.small)
+    table.cell(tbl, 0, 3, "BOX", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 3, str.tostring(dnChan, format.mintick) + " – " + str.tostring(upChan, format.mintick) + "  (" + str.tostring(boxW, "#.#") + " ATR" + (inWin and not na(winStart) ? ", " + tostring(winAge) + "h" : "") + ")", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 4, "CUSHION", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 4, str.tostring(cushNear, "#.##") + " ATR to the " + cushSide + "side", text_color = cushNear <= 1.0 ? color.new(color.red, 0) : color.white, text_size = size.small)
+    table.cell(tbl, 0, 5, "BTC TRIPWIRE", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 5, btcBrkUp ? "⚠ BTC broke box UP" : btcBrkDn ? "⚠ BTC broke box DOWN" : "OK — BTC inside its box", text_color = btcOk ? color.new(color.green, 0) : color.new(color.red, 0), text_size = size.small)
+    table.cell(tbl, 0, 6, "2σ BAR", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 6, sig ? "NOW" : na(sigAgo) ? "never" : tostring(sigAgo) + " bars ago" + (volSpike ? " +vol" : ""), text_color = sig ? color.new(color.red, 0) : color.white, text_size = size.small)
+    table.cell(tbl, 0, 7, "STATUS", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 7, "research artifact — not a trade recommendation", text_color = color.new(color.orange, 20), text_size = size.small)
+    table.cell(tbl, 0, 8, "LONG GRID", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 8, setup ? "SETUP NOW — stop " + str.tostring(nz(pendStop, low), format.mintick) :
+                  armed ? "armed: sweep " + tostring(bar_index - nz(pendSweep, bar_index)) + " bars ago · stop " + str.tostring(nz(pendStop, 0.0), format.mintick) :
+                  "waiting (sweep + reclaim)",
+               text_color = setup ? color.new(color.green, 0) : armed ? color.new(color.orange, 0) : color.silver, text_size = size.small)
+    table.cell(tbl, 0, 9, "GATE 1D (display)", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 9, gate1d ? "1d close > 1d EMA21" : "1d close ≤ 1d EMA21", text_color = gate1d ? color.new(color.green, 0) : color.new(color.orange, 0), text_size = size.small)
+    table.cell(tbl, 0, 10, "BOXES (journal)", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    if nJ == 0
+        table.cell(tbl, 1, 10, "no closed boxes yet", text_color = color.silver, text_size = size.small)
+    for i = 0 to 19
+        if i < nJ
+            table.cell(tbl, 0, 11 + i, tostring(i + 1), text_color = color.silver, text_size = size.small)
+            table.cell(tbl, 1, 11 + i, array.get(journal, i), text_color = color.white, text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+// ALERTS — signals & alerts only. NO order execution, ever.
+// ════════════════════════════════════════════════════════════════════════════
+deployEv = state == "DEPLOYABLE" and state[1] != "DEPLOYABLE"
+exitIn   = inWin[1] and not inWin
+hardEv   = exitIn and (state == "EXPOSED_UP" or state == "EXPOSED_DN")
+softEv   = btcBrk and not btcBrk[1]
+sigEv    = sig
+
+alertcondition(deployEv, "GridBox – DEPLOY OK",     "GRIDBOX {{ticker}} ({{interval}}): box settled & quiet (DEPLOYABLE)")
+alertcondition(hardEv,   "GridBox – HARD EXIT",     "GRIDBOX {{ticker}} ({{interval}}): box BROKE " + "— check inventory")
+alertcondition(softEv,   "GridBox – BTC SOFT EXIT", "GRIDBOX {{ticker}}: BTC broke its box — de-risk leg")
+alertcondition(sigEv,    "GridBox – 2σ BAR",        "GRIDBOX {{ticker}} ({{interval}}): 2-sigma 1h bar")
+alertcondition(setup,    "GridBox – LONG GRID SETUP", "GRIDBOX {{ticker}} ({{interval}}): liquidity sweep + reclaim — long-grid setup, stop at sweep low")
+
+if inJsonAlerts and (deployEv or hardEv or softEv or sigEv or setup)
+    event = deployEv ? "DEPLOY_OK" : hardEv ? "HARD_EXIT" : softEv ? "SOFT_EXIT_BTC" : setup ? "LONG_GRID_SETUP" : "SIGMA_BAR"
+    alert('{"tool":"grid-box-guardian","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","event":"' + event + '","state":"' + state + '","adx":' + str.tostring(math.round(adx * 10) / 10, "#.#") + ',"cush_atr":' + str.tostring(math.round(cushNear * 100) / 100, "#.##") + ',"box_top":' + str.tostring(upChan, format.mintick) + ',"box_bot":' + str.tostring(dnChan, format.mintick) + ',"long_grid_stop":' + (armed or setup ? str.tostring(pendStop, format.mintick) : "null") + ',"long_grid_box":' + (armed ? '"' + str.tostring(pendL, format.mintick) + '-' + str.tostring(pendH, format.mintick) + '"' : "null") + ',"btc_break_up":' + (btcBrkUp ? "true" : "false") + ',"btc_break_dn":' + (btcBrkDn ? "true" : "false") + ',\"gate_1d\":' + (gate1d ? "true" : "false") + '}', alert.freq_once_per_bar_close)

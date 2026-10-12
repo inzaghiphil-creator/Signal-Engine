@@ -94,11 +94,13 @@ NaN comparison = false (0 points).
 |---|---|
 | 45m trend (20) | full bearish alignment (2) · else 9<21 (1) · close<EMA200 (1) · close<EMA55 (1) |
 | 15m momentum (20) | hist<0 (1) · hist falling (1) · RSI<50 (1) · EMA9<EMA21 (1) · RSI falling (1) |
-| 5m EMA structure (15) | 9<21 (1) · 21<55 (1) · close<EMA9 (1) · EMA55 falling (1) |
+| 5m EMA structure (15) | 9<21 (1) · 21<55 (1) · close<EMA9 (1) · EMA21 falling (1) ¹ |
 | RSI (10) | RSI<50 (1) · RSI falling (1) · RSI>30 (1) |
 | MACD (10) | hist<0 (1) · line<0 (1) · hist falling (1) |
 | Volume (15) | vol>1.5×SMA20 (2) · close<open (1) · vol rising (1) |
 | Structure (10) | fresh pivot-low breakdown: close<lastPl (2) · resistance retest rejection: high≥lastPh−0.3×ATR and close<lastPh−0.1×ATR (1) · EMA21 falling (1) |
+
+¹ Asymmetry: the long side uses EMA55-rising, the short side EMA21-falling — implemented consistently in all three implementations (Python, strategy, indicator). An earlier draft of this spec said EMA55-falling for shorts; whether the short side should mirror the long side is an open question for the diagnosis phase, not a change to make now.
 
 ## 6. REVERSAL scoring (100 points)
 

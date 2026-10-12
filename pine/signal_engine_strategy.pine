@@ -2,8 +2,16 @@
 // https://www.mozilla.org/MPL/2.0/
 //
 // ─────────────────────────────────────────────────────────────────────────────
-//  NEAR SIGNAL ENGINE — STRATEGY v1.0 (performance measurement)
+//  NEAR SIGNAL ENGINE — STRATEGY v2.1 (performance measurement)
 //  Pine Script v6 · TradingView
+//
+//  ┌─────────────────────────────────────────────────────────────────────────┐
+//  │  STATUS: RETIRED FOR NEAR 5M — research closure 2026-10-12            │
+//  │  Charter SIGNAL-ENGINE-NEAR5M-RETIREMENT. No tested variant passed the │
+//  │  profitability acceptance gates. This is a RETAINED RESEARCH ARTIFACT, │
+//  │  NOT an authorised trade recommendation. Do not deploy to live trading.│
+//  │  See docs/RESEARCH_CLOSURE_REPORT.md.                                  │
+//  └─────────────────────────────────────────────────────────────────────────┘
 //
 //  Purpose: measure the SAME signal logic used by pine/signal_engine.pine
 //  after fees and slippage — win rate, profit factor, max drawdown,
@@ -93,6 +101,7 @@ inBlockAbnormal = input.bool(true, "Block entries in ABNORMAL VOL regime", group
 
 inStrictTrend = input.bool(true, "SCALP: require full HTF EMA alignment", group = "Gates")
 inVwapGate = input.bool(false, "Require session VWAP alignment", group = "Gates")
+inConfirmBars = input.int(0, "Confirmation window (0 = immediate)", minval = 0, maxval = 3, group = "Gates", tooltip = "0 = enter at signal-bar close (baseline). 1-3 = wait up to N completed bars: LONG confirms on a close above the signal bar's high, SHORT on a close below its low; a breach of the signal bar's opposite extreme cancels; unconfirmed pendings expire. Stop/target/room are re-derived from the confirmed entry price; entries failing the room requirement are rejected.")
 
 inShowTable = input.bool(true, "Show stats table", group = "Display")
 
@@ -105,13 +114,13 @@ inQtyPct = input.float(10, "Position size % of equity", minval = 1, maxval = 100
 inFeePct = input.float(0.1, "Commission % per side (KuCoin taker)", minval = 0, step = 0.01, group = "Strategy Mechanics")
 inSlipTicks = input.int(2, "Slippage (ticks)", minval = 0, group = "Strategy Mechanics", tooltip = "1 tick = symbol mintick. 2 ticks on a 0.0001-tick quote ≈ 0.0002.")
 
-strategy("NEAR SIGNAL ENGINE [STRATEGY]", "SIGNAL ENGINE STRAT v1.0", overlay = true,
-     initial_capital = inCap,
+strategy("NEAR SIGNAL ENGINE [STRATEGY]", "SIGENG1", overlay = true,
+     initial_capital = 10000,
      default_qty_type = strategy.percent_of_equity,
-     default_qty_value = inQtyPct,
+     default_qty_value = 10,
      commission_type = strategy.commission.percent,
-     commission_value = inFeePct,
-     slippage = inSlipTicks,
+     commission_value = 0.1,
+     slippage = 2,
      pyramiding = 0,
      process_orders_on_close = true)
 
@@ -144,10 +153,12 @@ f_pack_mom(src, h, l) =>
     dnMove = l[1] - l
     plusDM = upMove > dnMove and upMove > 0 ? upMove : 0.0
     minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0.0
-    trS = ta.tr(h, l, src[1])
+    trS = ta.tr(true)
     trRma = ta.rma(trS, inAdxLen)
-    diPlusS = trRma > 0 ? 100 * ta.rma(plusDM, inAdxLen) / trRma : 0.0
-    diMinusS = trRma > 0 ? 100 * ta.rma(minusDM, inAdxLen) / trRma : 0.0
+    rmaPlus = ta.rma(plusDM, inAdxLen)
+    rmaMinus = ta.rma(minusDM, inAdxLen)
+    diPlusS = trRma > 0 ? 100 * rmaPlus / trRma : 0.0
+    diMinusS = trRma > 0 ? 100 * rmaMinus / trRma : 0.0
     diSum = diPlusS + diMinusS
     dxS = diSum > 0 ? 100 * math.abs(diPlusS - diMinusS) / diSum : 0.0
     adxS = ta.rma(dxS, inAdxLen)
@@ -285,7 +296,7 @@ scoreM15S = wM15 * (sM15aS + sM15bS + sM15cS + sM15dS + sM15eS) / 5
 sE5aS = eF < eM ? 1.0 : 0.0
 sE5bS = eM < eS ? 1.0 : 0.0
 sE5cS = close < eF ? 1.0 : 0.0
-eMrDnE = na(eMrE) ? false : not eMrE
+eMrDnE = not eMrE
 sE5dS = eMrDnE ? 1.0 : 0.0
 scoreE5S = wE5 * (sE5aS + sE5bS + sE5cS + sE5dS) / 4
 sRsiS = (rsiE < inRsiMid ? 1.0 : 0.0) + (rsiE < rsiPE ? 1.0 : 0.0) + (rsiE > inRsiOs ? 1.0 : 0.0)
@@ -389,9 +400,21 @@ var float tgtPx = na
 var float lastExitPxStrat = na
 var string lastExitReasonStrat = ""
 
+// confirmation-entry experiment state (inert when inConfirmBars == 0)
+var int pendSide = 0
+var int pendSigBar = 0
+var float pendSigHigh = na
+var float pendSigLow = na
+var int pendDeadline = 0
+var float pendRoomBase = na
+
 // per-bar close bookkeeping (re-initialized every bar)
 string exitReasonBar = ""
 float exitPxBar = na
+bool flatAfterRev = false
+int revSide = 0
+bool confirmedEntry = false
+bool revEntered = false
 
 longEntryFill = strategy.position_size > 0 and strategy.position_size[1] <= 0
 shortEntryFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
@@ -403,49 +426,110 @@ if strategy.position_size > 0 and inTrendExit and isScalp and trend45 == -1 and 
     exitReasonBar := "TREND FLIP"
     exitPxBar := close
     strategy.close("Long", comment = "TREND FLIP")
-    strategy.cancel("L-Exit", "Long")
+    strategy.cancel("L-Exit")
     stopPx := na
     tgtPx := na
+    flatAfterRev := true
 if strategy.position_size < 0 and inTrendExit and isScalp and trend45 == 1 and not longSig
     exitReasonBar := "TREND FLIP"
     exitPxBar := close
     strategy.close("Short", comment = "TREND FLIP")
-    strategy.cancel("S-Exit", "Short")
+    strategy.cancel("S-Exit")
     stopPx := na
     tgtPx := na
+    flatAfterRev := true
 
 if strategy.position_size > 0 and shortSig
     exitReasonBar := "REVERSAL"
     exitPxBar := close
     strategy.close("Long", comment = "REVERSAL")
-    strategy.cancel("L-Exit", "Long")
+    strategy.cancel("L-Exit")
     stopPx := na
     tgtPx := na
-    strategy.entry("Short", strategy.short)
-    stopPx := close + inStopAtr * atrE
-    tgtPx := close - inTgtAtr * atrE
-    strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+    flatAfterRev := true
+    revSide := -1
+    if inConfirmBars == 0
+        strategy.entry("Short", strategy.short)
+        stopPx := close + inStopAtr * atrE
+        tgtPx := close - inTgtAtr * atrE
+        strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+        revEntered := true
 else if strategy.position_size < 0 and longSig
     exitReasonBar := "REVERSAL"
     exitPxBar := close
     strategy.close("Short", comment = "REVERSAL")
-    strategy.cancel("S-Exit", "Short")
+    strategy.cancel("S-Exit")
     stopPx := na
     tgtPx := na
-    strategy.entry("Long", strategy.long)
-    stopPx := close - inStopAtr * atrE
-    tgtPx := close + inTgtAtr * atrE
-    strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
-else if strategy.position_size == 0 and longSig
-    strategy.entry("Long", strategy.long)
-    stopPx := close - inStopAtr * atrE
-    tgtPx := close + inTgtAtr * atrE
-    strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
-else if strategy.position_size == 0 and shortSig
-    strategy.entry("Short", strategy.short)
-    stopPx := close + inStopAtr * atrE
-    tgtPx := close - inTgtAtr * atrE
-    strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+    flatAfterRev := true
+    revSide := 1
+    if inConfirmBars == 0
+        strategy.entry("Long", strategy.long)
+        stopPx := close - inStopAtr * atrE
+        tgtPx := close + inTgtAtr * atrE
+        strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
+        revEntered := true
+
+// confirmation experiment: resolve the pending entry (breach before confirm)
+if inConfirmBars > 0 and pendSide != 0 and strategy.position_size == 0
+    if bar_index > pendDeadline
+        pendSide := 0
+    else if pendSide == 1
+        if low < pendSigLow
+            pendSide := 0
+        else if close > pendSigHigh
+            float cSigL = close[bar_index - pendSigBar]
+            float pivotL = na(pendRoomBase) ? BIG : pendRoomBase + cSigL
+            float roomNewL = na(pendRoomBase) or close >= pivotL ? BIG : pivotL - close
+            if not inRequireRoom or roomNewL >= inMinRoomAtr * atrE
+                strategy.entry("Long", strategy.long)
+                stopPx := close - inStopAtr * atrE
+                tgtPx := close + inTgtAtr * atrE
+                strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
+                confirmedEntry := true
+            pendSide := 0
+    else
+        if high > pendSigHigh
+            pendSide := 0
+        else if close < pendSigLow
+            float cSigS = close[bar_index - pendSigBar]
+            float pivotS = na(pendRoomBase) ? BIG : cSigS - pendRoomBase
+            float roomNewS = na(pendRoomBase) or close <= pivotS ? BIG : close - pivotS
+            if not inRequireRoom or roomNewS >= inMinRoomAtr * atrE
+                strategy.entry("Short", strategy.short)
+                stopPx := close + inStopAtr * atrE
+                tgtPx := close - inTgtAtr * atrE
+                strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
+                confirmedEntry := true
+            pendSide := 0
+
+// entries (immediate, or pending when the confirmation experiment is on)
+// note: on a bar where a close() was placed above, strategy.position_size
+// still reads the pre-fill state, so flatAfterRev restores baseline behavior
+bool effFlat = strategy.position_size == 0 or flatAfterRev
+bool sigL = longSig
+bool sigS = shortSig
+if revSide != 0
+    sigL := revSide == 1
+    sigS := revSide == -1
+if effFlat and not confirmedEntry and not revEntered and not (inConfirmBars == 0 and flatAfterRev and revSide == 0)
+    if inConfirmBars > 0 and (sigL or sigS)
+        pendSide := sigL ? 1 : -1
+        pendSigBar := bar_index
+        pendSigHigh := high
+        pendSigLow := low
+        pendDeadline := bar_index + inConfirmBars
+        pendRoomBase := sigL ? roomLong : roomShort
+    else if sigL
+        strategy.entry("Long", strategy.long)
+        stopPx := close - inStopAtr * atrE
+        tgtPx := close + inTgtAtr * atrE
+        strategy.exit("L-Exit", "Long", stop = stopPx, limit = tgtPx)
+    else if sigS
+        strategy.entry("Short", strategy.short)
+        stopPx := close + inStopAtr * atrE
+        tgtPx := close - inTgtAtr * atrE
+        strategy.exit("S-Exit", "Short", stop = stopPx, limit = tgtPx)
 
 plotshape(longEntryFill, title = "Long entry", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 0), size = size.small)
 plotshape(shortEntryFill, title = "Short entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
@@ -557,13 +641,13 @@ if inShowTable and barstate.islast
     tbl.cell(0, 0, syminfo.ticker + " SIGNAL ENGINE STRATEGY", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
     tbl.cell(1, 0, inMode, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
     tbl.cell(2, 0, "chart " + timeframe.period, text_color = tfWarn ? color.new(color.yellow, 0) : color.white, bgcolor = tfWarn ? color.new(color.red, 40) : hdrBg, text_size = size.small)
-    tbl.cell(3, 0, "v1.0", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(3, 0, "v2.1", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
     tbl.cell(4, 0, tfWarn ? "⚠ chart TF ≠ entry TF" : "OK", text_color = tfWarn ? color.new(color.yellow, 0) : color.white, bgcolor = tfWarn ? color.new(color.red, 40) : hdrBg, text_size = size.small)
 
     tbl.cell(0, 1, "NET PROFIT", text_color = color.gray, text_size = size.small)
     tbl.cell(1, 1, str.tostring(strategy.netprofit, "0.00"), text_color = strategy.netprofit >= 0 ? color.new(color.lime, 0) : color.new(color.red, 0), text_size = size.small)
     tbl.cell(2, 1, "PF " + str.tostring(pfAll, "0.00"), text_color = pfAll >= 1 ? color.new(color.lime, 0) : color.new(color.red, 0), text_size = size.small)
-    tbl.cell(3, 1, "MAX DD " + str.tostring(strategy.max_drawdown(), "0.00") + "%", text_color = color.silver, text_size = size.small)
+    tbl.cell(3, 1, "MAX DD " + str.tostring(strategy.max_drawdown, "0.00"), text_color = color.silver, text_size = size.small)
     tbl.cell(4, 1, "WIN " + str.tostring(winRateAll, "0.0") + "% (" + str.tostring(totalTrades) + ")", text_color = color.silver, text_size = size.small)
 
     tbl.cell(0, 2, "REGIME", text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
@@ -606,7 +690,7 @@ if inShowTable and barstate.islast
 
     tbl.cell(0, 9, "NOTES", text_color = color.gray, text_size = size.small)
     table.merge_cells(tbl, 1, 9, 4, 9)
-    tbl.cell(1, 9, "entry = signal-bar close · fees & slippage applied · stop-before-target tie-break · non-repainting HTF data", text_color = color.new(color.white, 40), text_size = size.small)
+    tbl.cell(1, 9, "⚠ RETIRED (research artifact, not a trade recommendation) · " + (inConfirmBars > 0 ? "entry = confirming-bar close (wait ≤" + str.tostring(inConfirmBars) + " bars) · " : "entry = signal-bar close · ") + "fees & slippage applied · stop-before-target tie-break · non-repainting HTF data", text_color = color.new(color.orange, 20), text_size = size.small)
 
 // ════════════════════════════════════════════════════════════════════════════
 // ALERTS — identical contract to the indicator (webhook JSON ready)
@@ -628,8 +712,8 @@ f_compRev(side) =>
     "\"rejection\":" + str.tostring(math.round(nz(side > 0 ? scoreRejL : scoreRejS)), "0") + ',"momentum":' + str.tostring(math.round(nz(side > 0 ? scoreMtnL : scoreMtnS)), "0") + ',"htf_weakening":' + str.tostring(math.round(nz(side > 0 ? scoreHwfL : scoreHwfS)), "0") + ',"flip":' + str.tostring(math.round(nz(side > 0 ? scoreFlpL : scoreFlpS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreRvlL : scoreRvlS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreRstL : scoreRstS)), "0")
 f_comp(side) =>
     isScalp ? f_compScalp(side) : f_compRev(side)
-f_json(event, side, px, scoreVal, compJson, reason) =>
-    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(time, "0") + ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (strategy.position_size == 0 ? "null" : str.tostring(strategy.position_avg_price, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
+f_json(string event, string side, float px, float scoreVal, string compJson, string reason) =>
+    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"NEAR-USDT","time_ms":' + str.tostring(time, "0") + ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (strategy.position_size == 0 ? "null" : str.tostring(strategy.position_avg_price, format.mintick)) + ',"stop":' + (na(stopPx) ? "null" : str.tostring(stopPx, format.mintick)) + ',"target":' + (na(tgtPx) ? "null" : str.tostring(tgtPx, format.mintick)) + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
 
 if inAlerts and inJsonAlerts and longEntryFill
     alert(f_json("BUY", "LONG", close, isScalp ? scoreLongTotal : revScoreLongTotal, f_comp(1), "score " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)

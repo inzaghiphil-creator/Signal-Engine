@@ -7,3 +7,5 @@ __pycache__/
 data/trades_*.csv
 # real exchange exports (local only — see docs/NEXT_STEPS.md)
 data/*_real*.csv
+# user data-source downloads (local only)
+google_drive/

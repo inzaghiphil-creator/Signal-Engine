@@ -5,6 +5,15 @@
 //  NEAR SIGNAL ENGINE v2.0 — multi-timeframe weighted-scoring indicator
 //  Pine Script v6 · TradingView
 //
+//  ┌─────────────────────────────────────────────────────────────────────────┐
+//  │  STATUS: RETIRED FOR NEAR 5M — research closure 2026-10-12            │
+//  │  Charter SIGNAL-ENGINE-NEAR5M-RETIREMENT. No tested variant passed the │
+//  │  profitability acceptance gates. Retained as a research artifact and   │
+//  │  parity reference — NOT an authorised trade recommendation. Do not     │
+//  │  use these signals to authorise live orders.                           │
+//  │  See docs/RESEARCH_CLOSURE_REPORT.md.                                  │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//
 //  MODES
 //    SCALP    trend-following breakout (with 45m alignment requirement)
 //    REVERSAL countertrend rejection (requires rejection + weakening momentum)
@@ -37,7 +46,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 //@version=6
-indicator("NEAR SIGNAL ENGINE", "NEAR SIGNAL ENGINE v1.0 [SCALP/REVERSAL]", shorttitle = "NEAR SIGNAL ENGINE", overlay = true, max_labels_count = 500)
+indicator("NEAR SIGNAL ENGINE", "NEAR SIGNAL ENGINE v2.1 [SCALP/REVERSAL]", shorttitle = "NEAR SIGNAL ENGINE", overlay = true, max_labels_count = 500)
 
 // ════════════════════════════════════════════════════════════════════════════
 // INPUTS
@@ -156,10 +165,12 @@ f_pack_mom(src, h, l) =>
     dnMove = l[1] - l
     plusDM = upMove > dnMove and upMove > 0 ? upMove : 0.0
     minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0.0
-    trS = ta.tr(h, l, src[1])
+    trS = ta.tr(true)
     trRma = ta.rma(trS, inAdxLen)
-    diPlusS = trRma > 0 ? 100 * ta.rma(plusDM, inAdxLen) / trRma : 0.0
-    diMinusS = trRma > 0 ? 100 * ta.rma(minusDM, inAdxLen) / trRma : 0.0
+    rmaPlus = ta.rma(plusDM, inAdxLen)
+    rmaMinus = ta.rma(minusDM, inAdxLen)
+    diPlusS = trRma > 0 ? 100 * rmaPlus / trRma : 0.0
+    diMinusS = trRma > 0 ? 100 * rmaMinus / trRma : 0.0
     diSum = diPlusS + diMinusS
     dxS = diSum > 0 ? 100 * math.abs(diPlusS - diMinusS) / diSum : 0.0
     adxS = ta.rma(dxS, inAdxLen)
@@ -358,8 +369,8 @@ scoreM15S = wM15 * (sM15aS + sM15bS + sM15cS + sM15dS + sM15eS) / 5
 sE5aS = eFE < eME ? 1.0 : 0.0
 sE5bS = eME < eSE ? 1.0 : 0.0
 sE5cS = cE < eFE ? 1.0 : 0.0
-eSDnE = na(eSrE) ? false : not eSrE
-sE5dS = eSDnE ? 1.0 : 0.0
+eMrDnE = not eMrE
+sE5dS = eMrDnE ? 1.0 : 0.0
 scoreE5S = wE5 * (sE5aS + sE5bS + sE5cS + sE5dS) / 4
 sRsiS = (rsiE < inRsiMid ? 1.0 : 0.0) + (rsiE < rsiPE ? 1.0 : 0.0) + (rsiE > inRsiOs ? 1.0 : 0.0)
 scoreRsiS = wRsi * sRsiS / 3
@@ -367,7 +378,6 @@ sMcdS = (mhE < 0 ? 1.0 : 0.0) + (mlE < 0 ? 1.0 : 0.0) + (mhE < mhPE ? 1.0 : 0.0)
 scoreMcdS = wMcd * sMcdS / 3
 sVolS = (vE > inVolMult * vAvgE ? 2.0 : 0.0) + (cE < oE ? 1.0 : 0.0) + (vUpE ? 1.0 : 0.0)
 scoreVolS = wVol * sVolS / 4
-eMrDnE = na(eMrE) ? false : not eMrE
 sStrS = (plFreshE and cE < lastPlE ? 2.0 : 0.0) + (phValidE and hE >= lastPhE - 0.3 * atrE and cE < lastPhE - 0.1 * atrE ? 1.0 : 0.0) + (eMrDnE ? 1.0 : 0.0)
 scoreStrS = wStr * sStrS / 4
 scoreShortTotal = scoreT45S + scoreM15S + scoreE5S + scoreRsiS + scoreMcdS + scoreVolS + scoreStrS
@@ -631,7 +641,7 @@ if inShowTable and barstate.islast
     tbl.cell(1, 0, inMode, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
     tbl.cell(2, 0, "TF " + inHtf + " / " + inMid + " / " + inEntry, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
     tbl.cell(3, 0, "chart " + timeframe.period, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
-    tbl.cell(4, 0, "NON-REPAINT v1.0", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    tbl.cell(4, 0, "NON-REPAINT v2.1", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
 
     tbl.cell(0, 1, "BIAS", text_color = color.gray, text_size = size.small)
     tbl.cell(1, 1, "45M " + bias45Label, text_color = bias45Color, text_size = size.small)
@@ -701,8 +711,8 @@ f_compRev(side) =>
     "\"rejection\":" + str.tostring(math.round(nz(side > 0 ? scoreRejL : scoreRejS)), "0") + ',"momentum":' + str.tostring(math.round(nz(side > 0 ? scoreMtnL : scoreMtnS)), "0") + ',"htf_weakening":' + str.tostring(math.round(nz(side > 0 ? scoreHwfL : scoreHwfS)), "0") + ',"flip":' + str.tostring(math.round(nz(side > 0 ? scoreFlpL : scoreFlpS)), "0") + ',"volume":' + str.tostring(math.round(nz(side > 0 ? scoreRvlL : scoreRvlS)), "0") + ',"structure":' + str.tostring(math.round(nz(side > 0 ? scoreRstL : scoreRstS)), "0")
 f_comp(side) =>
     isScalp ? f_compScalp(side) : f_compRev(side)
-f_json(event, side, px, scoreVal, compJson, reason) =>
-    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"' + syminfo.ticker + '","time_ms":' + str.tostring(nz(tE), "0") + ',"time":"' + str.format_time(nz(tE), "yyyy-MM-dd'T'HH:mm:ss'Z'") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (pos != 0 and not na(entryPx) ? str.tostring(entryPx, format.mintick) : "null") + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
+f_json(string event, string side, float px, float scoreVal, string compJson, string reason) =>
+    '{"source":"signal-engine","version":"2.0.0","event":"' + event + '","side":"' + side + '","mode":"' + inMode + '","symbol":"NEAR-USDT","time_ms":' + str.tostring(nz(tE), "0") + ',"time":"' + str.format_time(nz(tE), "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '","entry_tf":"' + inEntry + '","score":' + str.tostring(math.round(nz(scoreVal)), "0") + ',"threshold":' + str.tostring(thrNow, "0") + ',"components":{' + compJson + '},"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + ',"atr":' + str.tostring(nz(atrE), format.mintick) + ',"rr":' + str.tostring(inTgtAtr / inStopAtr, "0.00") + ',"regime":"' + regimeLabel + '","position":{"side":"' + posLabel + '","entry":' + (pos != 0 and not na(entryPx) ? str.tostring(entryPx, format.mintick) : "null") + ',"stop":' + (pos != 0 and not na(stopPx) ? str.tostring(stopPx, format.mintick) : "null") + ',"target":' + (pos != 0 and not na(tgtPx) ? str.tostring(tgtPx, format.mintick) : "null") + '},"reason":"' + reason + '","meta":{"repainting":"none","execution":"none"}}'
 
 if inAlerts and inJsonAlerts and longSig
     alert(f_json("BUY", "LONG", cE, isScalp ? scoreLongTotal : revScoreLongTotal, f_comp(1), "score " + str.tostring(math.round(nz(isScalp ? scoreLongTotal : revScoreLongTotal)), "0") + " >= " + str.tostring(thrNow, "0")), alert.freq_once_per_bar)
